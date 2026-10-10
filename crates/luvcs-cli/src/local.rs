@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use luvcs::api::{HostContext, VcsRepoInfo, VcsRequest, VcsResponse, execute};
 use luvcs::digest::RustDigest;
 use luvcs::model::ActorKind;
+use luvcs::remote::Remote;
 use luvcs::store::SchemaRegistry;
+use luvcs::sync::{self, PullReport, PushReport};
 use rusqlite::Connection;
 
 /// Directory of the store inside a work tree.
@@ -47,6 +49,41 @@ impl Local {
 
     pub fn execute(&self, request: VcsRequest) -> VcsResponse {
         execute(&self.conn, &self.host(), request)
+    }
+
+    /// The one repo of this store called `name`, if there is one.
+    pub fn find_repo(&self, name: &str) -> anyhow::Result<Option<String>> {
+        let repos = match self.execute(VcsRequest::ListRepos) {
+            VcsResponse::Repos { repos } => repos,
+            VcsResponse::Error { error } => anyhow::bail!("{}: {}", error.code, error.message),
+            other => anyhow::bail!("unexpected response: {other:?}"),
+        };
+        if !repos.iter().any(|r| r.name == name) {
+            return Ok(None);
+        }
+        // Several repos of that name is an error that lists their ids.
+        match_repo_name(&repos, name)
+            .map(Some)
+            .map_err(anyhow::Error::msg)
+    }
+
+    pub fn push(
+        &self,
+        remote: &dyn Remote,
+        remote_name: &str,
+        repo_id: &str,
+    ) -> anyhow::Result<PushReport> {
+        Ok(sync::push(
+            &self.conn,
+            &self.host(),
+            remote,
+            remote_name,
+            repo_id,
+        )?)
+    }
+
+    pub fn pull(&self, remote: &dyn Remote, remote_name: &str) -> anyhow::Result<PullReport> {
+        Ok(sync::pull(&self.conn, &self.host(), remote, remote_name)?)
     }
 
     /// Resolves a repo argument (an id or a unique name) to its id.

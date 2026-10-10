@@ -1,19 +1,19 @@
 [package]
 name = "luvcs-protocol"
-description = "Wire types between luvcs and a storage backend"
+description = "Wire types between luvcs and a remote"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish.workspace = true
 
 [features]
-ts = ["dep:ts-rs"]
-uniffi = ["dep:uniffi"]
+default = ["config"]
+# `RemoteConfig`: the eure form of "how to reach a remote".
+config = ["dep:eure"]
 
 [dependencies]
-luvcs-macros = { path = "../luvcs-macros" }
 serde = { workspace = true }
+eure = { version = "0.1.6", optional = true }
+
+[dev-dependencies]
 serde_json = { workspace = true }
-eure = "0.1.6"
-ts-rs = { workspace = true, optional = true }
-uniffi = { workspace = true, optional = true }

@@ -10,6 +10,7 @@
 //! back.
 
 mod local;
+mod remote_config;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -120,6 +121,39 @@ pub enum LuvCommands {
         /// Only these paths (default: every tracked file)
         paths: Vec<String>,
     },
+    /// Choose where `push` and `pull` go
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommands,
+    },
+    /// Send this repo's history to the remote
+    Push,
+    /// Take in what the remote has; does not touch the files on disk
+    Pull,
+    /// Serve a directory as a remote on stdin and stdout, the reference
+    /// implementation of the protocol a `remote set --command` program speaks
+    #[command(hide = true)]
+    Serve {
+        /// The directory that holds the log and the blobs
+        #[arg(long)]
+        path: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RemoteCommands {
+    /// Set the remote: a directory several devices reach, or a command that
+    /// speaks the luvcs protocol on stdin and stdout
+    Set {
+        /// A shared directory (relative paths are from the work tree root)
+        #[arg(long, conflicts_with = "command", required_unless_present = "command")]
+        path: Option<String>,
+        /// A program to run for every push and pull, split on spaces
+        #[arg(long)]
+        command: Option<String>,
+    },
+    /// Print the remote
+    Show,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -128,8 +162,12 @@ fn main() -> anyhow::Result<()> {
 
 fn run(args: LuvArgs) -> anyhow::Result<()> {
     let cwd = std::env::current_dir()?;
-    if let LuvCommands::Init { repo, include } = args.command {
-        return init(&cwd, repo, include);
+    match args.command {
+        LuvCommands::Init { repo, include } => return init(&cwd, repo, include),
+        LuvCommands::Remote { command } => return remote_command(&cwd, command),
+        LuvCommands::Pull => return pull(&cwd),
+        LuvCommands::Serve { path } => return serve(&path),
+        _ => {}
     }
     let tree = WorkTree::discover(&cwd)?;
     let device = Local::open(&tree.root)?;
@@ -140,7 +178,11 @@ fn run(args: LuvArgs) -> anyhow::Result<()> {
         repo_id,
     };
     match args.command {
-        LuvCommands::Init { .. } => unreachable!(),
+        LuvCommands::Init { .. }
+        | LuvCommands::Remote { .. }
+        | LuvCommands::Pull
+        | LuvCommands::Serve { .. } => unreachable!(),
+        LuvCommands::Push => ctx.push(),
         LuvCommands::Status => ctx.status(),
         LuvCommands::Diff { paths } => ctx.diff(&paths),
         LuvCommands::Commit { message, paths } => ctx.commit(&message, &paths),
@@ -167,16 +209,84 @@ fn init(cwd: &Path, repo: Option<String>, include: Vec<String>) -> anyhow::Resul
     };
     config.matcher()?; // reject a bad glob before anything is created
     let device = Local::open(cwd)?;
-    match device.execute(VcsRequest::CreateRepo { name: name.clone() }) {
-        VcsResponse::Repo { .. } => {}
-        VcsResponse::Error { error } => anyhow::bail!("{}: {}", error.code, error.message),
-        other => anyhow::bail!("unexpected response: {other:?}"),
+    // A repo of this name that `luv pull` brought in is attached to rather
+    // than created again: this is how a second device starts.
+    let attached = device.find_repo(&name)?.is_some();
+    if !attached {
+        match device.execute(VcsRequest::CreateRepo { name: name.clone() }) {
+            VcsResponse::Repo { .. } => {}
+            VcsResponse::Error { error } => anyhow::bail!("{}: {}", error.code, error.message),
+            other => anyhow::bail!("unexpected response: {other:?}"),
+        }
     }
     std::fs::write(&config_path, config.render())?;
-    println!("Created repo {name} and {}", config_path.display());
+    if attached {
+        println!(
+            "Attached to repo {name} and wrote {}; `luv restore` writes its files.",
+            config_path.display()
+        );
+    } else {
+        println!("Created repo {name} and {}", config_path.display());
+    }
     if config.include.is_empty() {
         println!("include is empty: edit {CONFIG_FILE} to allowlist the files to track.");
     }
+    Ok(())
+}
+
+/// The directory whose `.luv` holds the store: the nearest ancestor with a
+/// `Luv.eure` or a `.luv`, else the current directory.
+fn store_root(cwd: &Path) -> PathBuf {
+    cwd.ancestors()
+        .find(|dir| dir.join(CONFIG_FILE).is_file() || dir.join(".luv").is_dir())
+        .unwrap_or(cwd)
+        .to_path_buf()
+}
+
+fn remote_command(cwd: &Path, command: RemoteCommands) -> anyhow::Result<()> {
+    let root = store_root(cwd);
+    match command {
+        RemoteCommands::Set { path, command } => {
+            let config = luvcs_protocol::RemoteConfig { path, command };
+            remote_config::save(&root, &config)?;
+            println!("remote set");
+            Ok(())
+        }
+        RemoteCommands::Show => {
+            match remote_config::load(&root)? {
+                Some(config) => print!("{}", remote_config::render(&config)),
+                None => println!("no remote"),
+            }
+            Ok(())
+        }
+    }
+}
+
+fn pull(cwd: &Path) -> anyhow::Result<()> {
+    let root = store_root(cwd);
+    let connected = remote_config::connect(&root)?;
+    let device = Local::open(&root)?;
+    let report = device.pull(connected.remote.as_ref(), &connected.name)?;
+    if report.entries == 0 && report.blobs == 0 {
+        println!("up to date");
+        return Ok(());
+    }
+    for repo in &report.repos {
+        println!("new repo {repo}");
+    }
+    println!(
+        "took in {} entries: {} objects, {} blobs",
+        report.entries, report.objects, report.blobs
+    );
+    println!("Your files are unchanged; see `luv log` for the heads.");
+    Ok(())
+}
+
+fn serve(path: &Path) -> anyhow::Result<()> {
+    let remote = luvcs::remote::DirRemote::open(path)?;
+    let stdin = std::io::stdin();
+    let stdout = std::io::stdout();
+    luvcs::remote::serve(&remote, "luv-dir", stdin.lock(), stdout.lock())?;
     Ok(())
 }
 
@@ -534,6 +644,24 @@ impl Ctx<'_> {
             VcsResponse::Object { object } => Ok(object.object_id),
             other => anyhow::bail!("unexpected response to save: {other:?}"),
         }
+    }
+
+    fn push(&self) -> anyhow::Result<()> {
+        let connected = remote_config::connect(&self.tree.root)?;
+        let report = self
+            .device
+            .push(connected.remote.as_ref(), &connected.name, &self.repo_id)?;
+        println!(
+            "pushed {} objects, {} blobs{}",
+            report.objects,
+            report.blobs,
+            if report.heads_announced {
+                ", heads announced"
+            } else {
+                ""
+            }
+        );
+        Ok(())
     }
 
     fn log(&self, limit: u32) -> anyhow::Result<()> {

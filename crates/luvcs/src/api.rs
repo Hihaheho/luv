@@ -39,7 +39,7 @@ pub struct HostContext<'a> {
 }
 
 impl HostContext<'_> {
-    fn random_16(&self) -> Result<[u8; 16], VcsError> {
+    pub(crate) fn random_16(&self) -> Result<[u8; 16], VcsError> {
         let mut out = [0u8; 16];
         (self.random)(&mut out).map_err(|m| VcsError::new("host", m))?;
         Ok(out)
@@ -135,19 +135,19 @@ fn decode_base64(what: &str, text: &str) -> ApiResult<Vec<u8>> {
         .map_err(|e| VcsError::invalid(format!("{what}: {e}")))
 }
 
-type ApiResult<T> = Result<T, VcsError>;
+pub(crate) type ApiResult<T> = Result<T, VcsError>;
 
 fn parse<T: std::str::FromStr<Err = crate::id::IdParseError>>(what: &str, s: &str) -> ApiResult<T> {
     s.parse::<T>()
         .map_err(|e| VcsError::invalid(format!("{what} {s:?}: {e}")))
 }
 
-struct LocalRepo {
-    repo_id: RepoId,
-    name: String,
-    key: IdKey,
-    workspace_id: WorkspaceId,
-    created_at_unix_ms: i64,
+pub(crate) struct LocalRepo {
+    pub(crate) repo_id: RepoId,
+    pub(crate) name: String,
+    pub(crate) key: IdKey,
+    pub(crate) workspace_id: WorkspaceId,
+    pub(crate) created_at_unix_ms: i64,
 }
 
 impl LocalRepo {
@@ -161,12 +161,12 @@ impl LocalRepo {
     }
 }
 
-fn ensure_local_schema(conn: &Connection) -> ApiResult<()> {
+pub(crate) fn ensure_local_schema(conn: &Connection) -> ApiResult<()> {
     conn.execute_batch(LOCAL_SCHEMA_SQL)?;
     Ok(())
 }
 
-fn local_repos(conn: &Connection) -> ApiResult<Vec<LocalRepo>> {
+pub(crate) fn local_repos(conn: &Connection) -> ApiResult<Vec<LocalRepo>> {
     let mut stmt = conn.prepare(
         "SELECT repo_id, name, id_key, workspace_id, created_at_unix_ms FROM vcs_local_repos ORDER BY created_at_unix_ms, repo_id",
     )?;
@@ -197,7 +197,7 @@ fn local_repos(conn: &Connection) -> ApiResult<Vec<LocalRepo>> {
     Ok(out)
 }
 
-fn local_repo(conn: &Connection, repo_id: &str) -> ApiResult<LocalRepo> {
+pub(crate) fn local_repo(conn: &Connection, repo_id: &str) -> ApiResult<LocalRepo> {
     let id: RepoId = parse("repo id", repo_id)?;
     local_repos(conn)?
         .into_iter()
@@ -1043,7 +1043,7 @@ fn repo_id_of(request: &VcsRequest) -> Option<&str> {
     }
 }
 
-fn insert_local_repo(conn: &Connection, local: &LocalRepo) -> ApiResult<()> {
+pub(crate) fn insert_local_repo(conn: &Connection, local: &LocalRepo) -> ApiResult<()> {
     let n = conn.execute(
         "INSERT OR IGNORE INTO vcs_local_repos (repo_id, name, id_key, workspace_id, created_at_unix_ms) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![

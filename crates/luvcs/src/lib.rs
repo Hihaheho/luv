@@ -14,6 +14,7 @@ pub mod id;
 pub mod merge;
 pub mod model;
 pub mod record;
+pub mod remote;
 pub mod tree;
 
 #[cfg(feature = "store")]
@@ -23,6 +24,8 @@ pub mod api_types;
 pub mod blob_store;
 #[cfg(feature = "store")]
 pub mod store;
+#[cfg(feature = "store")]
+pub mod sync;
 
 #[doc(hidden)]
 pub use serde as __serde;

@@ -20,6 +20,7 @@ uniffi = ["dep:uniffi"]
 
 [dependencies]
 luvcs-macros = { path = "../luvcs-macros" }
+luvcs-protocol = { path = "../luvcs-protocol", default-features = false }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }

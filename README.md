@@ -49,11 +49,11 @@ The core crate takes hashing, randomness, the clock and the device ID from the h
 ## What it is not
 
 - It is not git compatible. It cannot read a git repository and does not speak git's commands.
-- It is not distributed. There are no remotes, no push or pull, and no blob transfer. The store is a SQLite file under `.luv/` in the work tree. A repo can be exported and imported.
+- It is not a service and has no server of its own. Devices exchange history through a remote: an append-only log plus a blob store, which is a shared directory or a program that speaks the messages of `luvcs-protocol`. The store is a SQLite file under `.luv/` in the work tree. A repo can also be exported and imported.
 - It has no branches. There are no named references.
 - It does not take "every file in the directory". The CLI only sees files that match a glob in `Luv.eure`. A file that matches nothing is never saved, listed or deleted.
 - It is not only a line merger. Structured values are merged as structures. It does not, on the other hand, understand the meaning of text or the syntax of code when it merges.
-- It is not an encryption or access control tool. A repo's ID key is stored in the store in plain form. `.luv/` is created as a directory only its owner can enter. An exported archive has to be handled with the same care as the content itself.
+- It is not an encryption or access control tool. A repo's ID key is stored in the store in plain form, and the store file is readable only by its owner. The remote's log carries that key too, so that a device that pulls can verify what it takes in; the remote has to be kept as private as the content, and encrypting it is the remote's job. An exported archive needs the same care.
 
 ## CLI
 
@@ -66,6 +66,9 @@ luv diff
 luv commit -m "message"
 luv log
 luv restore [--commit cmt_...] [paths...]
+luv remote set --path ../shared      # or --command "program args"
+luv push
+luv pull
 ```
 
 `init` writes `Luv.eure`:
@@ -75,16 +78,18 @@ repo = "notes"
 include = ["**/*.md"]
 ```
 
-Undo / redo, integrate and conflict resolution exist in the request API but not yet in the CLI. Symbolic links are not tracked; luv prints a warning and skips them.
+`remote set` writes `.luv/remote.eure`, next to the store. `Luv.eure`, the file that is meant to travel with the files, never names a command, so checking out someone else's files cannot make `luv` run one. `push` sends what the remote has not seen and never conflicts. `pull` takes the remote's history in and leaves your files alone. A second device starts with `remote set`, `pull`, then `init --repo <name>`, which attaches to the repo that was pulled, and `restore`.
+
+Undo / redo, integrate and conflict resolution exist in the request API but not yet in the CLI. After concurrent commits a repo has several heads and `luv log` shows them all; merging them from the CLI is not there yet. Symbolic links are not tracked; luv prints a warning and skips them.
 
 ## Layout
 
 | Crate | What it is |
 |---|---|
-| `luvcs` | The core: objects, IDs, tree, merge, local store, request API |
+| `luvcs` | The core: objects, IDs, tree, merge, local store, request API, remotes, push and pull |
 | `luvcs-cli` | The `luv` command |
 | `luvcs-macros` | Attribute macro that generates the FFI-facing types |
-| `luvcs-protocol` | Types between luv and a storage backend (empty so far) |
+| `luvcs-protocol` | The messages between luvcs and a remote: log entries, blob chunks, remote configuration |
 
 ## License
 
