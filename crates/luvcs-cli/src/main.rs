@@ -330,7 +330,7 @@ impl WorkTree {
                 let name = entry.file_name().into_string().map_err(|n| {
                     anyhow::anyhow!("{} has a name that is not UTF-8: {n:?}", dir.display())
                 })?;
-                if prefix.is_empty() && matches!(name.as_str(), ".git" | ".jj") {
+                if is_reserved_name(&name) {
                     continue;
                 }
                 let rel = format!("{prefix}{name}");
@@ -749,9 +749,20 @@ fn is_safe_rel(rel: &str) -> bool {
         && !rel.contains('\0')
         && !Path::new(rel).is_absolute()
         && !rel.starts_with('/')
-        && rel
-            .split('/')
-            .all(|c| !c.is_empty() && c != "." && c != ".." && !c.contains(':'))
+        && rel.split('/').all(|c| {
+            !c.is_empty() && c != "." && c != ".." && !c.contains(':') && !is_reserved_name(c)
+        })
+}
+
+/// Names that belong to luv or to another VCS, at any depth: `.luv` holds the
+/// store and the remote (which may name a command), and `.git` / `.jj` can
+/// hold hooks. Repo content, which may come from someone else, must never be
+/// able to write them, and they are never tracked. Compared case-insensitively
+/// because the work tree may sit on a case-insensitive file system.
+fn is_reserved_name(name: &str) -> bool {
+    [".luv", ".git", ".jj"]
+        .iter()
+        .any(|reserved| name.eq_ignore_ascii_case(reserved))
 }
 
 /// A path argument as the allowlist sees it: `/`-separated, no `./`.
@@ -774,6 +785,36 @@ mod tests {
             config,
             matcher,
         }
+    }
+
+    #[test]
+    fn reserved_names_are_never_allowed_at_any_depth() {
+        let t = tree(&["**"]);
+        for path in [
+            ".luv/remote.eure",
+            ".luv/store.sqlite",
+            "sub/.luv/remote.eure",
+            ".git/hooks/pre-commit",
+            "a/.GIT/config",
+            ".Jj/x",
+            ".luv",
+        ] {
+            assert!(!t.allows(path), "{path} must not be allowed");
+        }
+        assert!(t.allows("notes/a.md"));
+        assert!(t.allows(".gitignore"), "only the exact names are reserved");
+    }
+
+    #[test]
+    fn write_refuses_reserved_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut t = tree(&["**"]);
+        t.root = dir.path().to_path_buf();
+        for path in [".luv/remote.eure", ".git/hooks/pre-commit", "x/.jj/y"] {
+            assert!(t.write(path, b"x").is_err(), "{path}");
+        }
+        assert!(!dir.path().join(".luv").exists());
+        t.write("ok/a.md", b"x").unwrap();
     }
 
     #[test]

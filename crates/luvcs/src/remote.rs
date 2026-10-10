@@ -197,12 +197,39 @@ pub struct DirRemote {
 /// Retries of an append that lost the race for an index.
 const APPEND_ATTEMPTS: usize = 64;
 
+/// Creates `path` and its missing parents readable by the owner only. The
+/// log carries each repo's ID key, so it is as sensitive as the store. A
+/// directory that already exists keeps the mode its owner gave it.
+fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+/// Writes `bytes` to a new file readable by the owner only.
+fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        options.mode(0o600);
+    }
+    options.open(path)?.write_all(bytes)
+}
+
 impl DirRemote {
     pub fn open(root: impl Into<PathBuf>) -> RemoteResult<Self> {
         let root = root.into();
-        std::fs::create_dir_all(root.join("log"))?;
-        std::fs::create_dir_all(root.join("blobs"))?;
-        std::fs::create_dir_all(root.join("tmp"))?;
+        create_private_dir_all(&root.join("log"))?;
+        create_private_dir_all(&root.join("blobs"))?;
+        create_private_dir_all(&root.join("tmp"))?;
         Ok(Self { root })
     }
 
@@ -293,9 +320,9 @@ impl Remote for DirRemote {
             return self.head();
         }
         let tmp = self.tmp_path();
-        std::fs::write(
+        write_private(
             &tmp,
-            serde_json::to_vec(entries).map_err(|e| RemoteError::Protocol(e.to_string()))?,
+            &serde_json::to_vec(entries).map_err(|e| RemoteError::Protocol(e.to_string()))?,
         )?;
         let result = (|| {
             for _ in 0..APPEND_ATTEMPTS {
@@ -323,9 +350,9 @@ impl Remote for DirRemote {
     ) -> RemoteResult<()> {
         check_chunk(bytes)?;
         let path = self.blob_path(repo_id, blob_id, index)?;
-        std::fs::create_dir_all(path.parent().expect("chunk has a parent"))?;
+        create_private_dir_all(path.parent().expect("chunk has a parent"))?;
         let tmp = self.tmp_path();
-        std::fs::write(&tmp, bytes)?;
+        write_private(&tmp, bytes)?;
         std::fs::rename(&tmp, &path)?;
         Ok(())
     }
@@ -634,6 +661,28 @@ mod tests {
             commit_ids: vec![format!("cmt_{n}")],
             refs: vec![],
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_dir_remote_is_private_to_its_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("remote");
+        let remote = DirRemote::open(&root).unwrap();
+        remote.append(&[heads(1)]).unwrap();
+        remote.put_blob_chunk("repo_a", "blob_a", 0, b"x").unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&root.join("log")), 0o700);
+        assert_eq!(mode(&root.join("blobs/repo_a/blob_a")), 0o700);
+        let log = std::fs::read_dir(root.join("log"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(mode(&log.path()), 0o600);
+        let chunk = root.join("blobs/repo_a/blob_a/0000000000");
+        assert_eq!(mode(&chunk), 0o600);
     }
 
     /// The contract every remote must meet.

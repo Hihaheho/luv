@@ -78,7 +78,7 @@ repo = "notes"
 include = ["**/*.md"]
 ```
 
-`remote set` writes `.luv/remote.eure`, next to the store. `Luv.eure`, the file that is meant to travel with the files, never names a command, so checking out someone else's files cannot make `luv` run one. `push` sends what the remote has not seen and never conflicts. `pull` takes the remote's history in and leaves your files alone. A second device starts with `remote set`, `pull`, then `init --repo <name>`, which attaches to the repo that was pulled, and `restore`.
+`remote set` writes `.luv/remote.eure`, next to the store. `Luv.eure`, the file that is meant to travel with the files, never names a command, and `.luv`, `.git` and `.jj` are never tracked or restored at any depth, so files that come from someone else's history cannot change the remote or make `luv` run a command. `push` sends what the remote has not seen and never conflicts. `pull` takes the remote's history in and leaves your files alone. A remote is trusted like a secret: the first time a repo arrives from a remote, luv accepts the ID key that remote gives it, so pull only from remotes you trust. A second device starts with `remote set`, `pull`, then `init --repo <name>`, which attaches to the repo that was pulled, and `restore`.
 
 Undo / redo, integrate and conflict resolution exist in the request API but not yet in the CLI. After concurrent commits a repo has several heads and `luv log` shows them all; merging them from the CLI is not there yet. Symbolic links are not tracked; luv prints a warning and skips them.
 
