@@ -28,7 +28,7 @@ A three-way merge (base / left / right) is a pure function: the same input alway
 - A record is merged per field path. The schema says, for each path, whether it is handled as Scalar, Set, List, Text or Opaque.
 - Elements of a collection have stable IDs. A Set merges adds and removals per element. A List also merges element order, and raises an order conflict only when both sides reordered it differently.
 
-A conflict is not written into the file as markers. It is recorded as a `Conflict` object that keeps each disagreement with its kind: value, order, deleted-vs-edited, or text region. You resolve it by taking one side, or by giving the text or the record directly.
+A conflict is not written into the file as markers. It is recorded as a `Conflict` object that keeps each disagreement with its kind: value, order, deleted-vs-edited, text region, or metadata (both sides renamed the object differently, say). You resolve it by taking one side, or by giving the text or the record directly, with a title when the title is in conflict.
 
 ### Operations are part of the history
 

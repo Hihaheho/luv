@@ -676,6 +676,9 @@ pub enum TermKind {
     DeletedVsEdited,
     /// A text region both sides changed differently.
     TextRegion,
+    /// Both sides set a metadata key (the term's path) to different values.
+    /// Candidates are the canonical CBOR of each side's value.
+    Metadata,
 }
 
 impl TermKind {
@@ -685,6 +688,7 @@ impl TermKind {
             TermKind::Order => "order",
             TermKind::DeletedVsEdited => "deleted_vs_edited",
             TermKind::TextRegion => "text_region",
+            TermKind::Metadata => "metadata",
         }
     }
 
@@ -694,6 +698,7 @@ impl TermKind {
             "order" => TermKind::Order,
             "deleted_vs_edited" => TermKind::DeletedVsEdited,
             "text_region" => TermKind::TextRegion,
+            "metadata" => TermKind::Metadata,
             _ => return None,
         })
     }

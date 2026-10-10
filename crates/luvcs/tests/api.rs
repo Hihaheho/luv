@@ -846,3 +846,215 @@ fn error_codes_serialize_as_snake_case_strings() {
     assert_eq!(serde_json::from_value::<VcsError>(json).unwrap(), error);
     assert_eq!(VcsErrorCode::NotFound.to_string(), "not_found");
 }
+
+/// A text object saved as `base` / "n.md", then changed to `left` here and
+/// to `right` on a second workspace (as another device would), and the right
+/// side integrated. Returns (repo, object id, integrate conflicts).
+fn diverge_and_integrate(
+    conn: &Connection,
+    host: &Host,
+    left: (&str, &str),
+    right: (&str, &str),
+) -> (String, String, Vec<luvcs::api::VcsConflictView>) {
+    let repo = create(conn, host);
+    let save = |text: &str, title: &str, id: Option<String>| match run(
+        conn,
+        host,
+        VcsRequest::SaveText {
+            repo_id: repo.clone(),
+            object_id: id,
+            type_id: "note".into(),
+            text: text.into(),
+            title: Some(title.into()),
+        },
+    ) {
+        VcsResponse::Object { object } => object.object_id,
+        other => panic!("{other:?}"),
+    };
+    let record = |d: &str| match run(
+        conn,
+        host,
+        VcsRequest::Record {
+            repo_id: repo.clone(),
+            description: d.into(),
+            objects: None,
+        },
+    ) {
+        VcsResponse::Commit { commit } => commit.commit_id,
+        other => panic!("{other:?}"),
+    };
+    let id = save("A\nB\nC\n", "n.md", None);
+    let base = record("base");
+    save(left.0, left.1, Some(id.clone()));
+    record("left");
+    let right = {
+        use luvcs::cbor::Value;
+        use luvcs::id::{IdKey, ObjectId, OperationId, RepoId, WorkspaceId};
+        use luvcs::model::Actor;
+        use luvcs::store::{OperationContext, RecordSource, Store};
+        let (repo_bytes, key): (Vec<u8>, Vec<u8>) = conn
+            .query_row("SELECT repo_id, id_key FROM vcs_local_repos", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        let mut store = Store::open(conn, RustDigest).unwrap();
+        let mut r = store
+            .repo(
+                RepoId::from_bytes(&repo_bytes).unwrap(),
+                IdKey(key.try_into().unwrap()),
+            )
+            .unwrap();
+        let ws2 = WorkspaceId([0xEE; 16]);
+        r.create_workspace(ws2, Some(base.parse().unwrap()))
+            .unwrap();
+        let oid: ObjectId = id.parse().unwrap();
+        let st = r
+            .put_text_state(
+                oid,
+                "note",
+                right.0.as_bytes(),
+                Value::map([("title", Value::text(right.1))]),
+            )
+            .unwrap();
+        let ctx = |n: u8| OperationContext {
+            operation_id: OperationId([0xD0 + n; 16]),
+            workspace_id: ws2,
+            expected_token: None,
+            actor: Actor {
+                kind: ActorKind::User,
+                device_id: "dev-b".into(),
+                description: String::new(),
+            },
+            reason: String::new(),
+            now_unix_ms: 5,
+        };
+        r.save_working(&ctx(1), &[(oid, Some(st))]).unwrap();
+        r.record(&ctx(2), RecordSource::Working, "right")
+            .unwrap()
+            .to_string()
+    };
+    let conflicts = match run(
+        conn,
+        host,
+        VcsRequest::Integrate {
+            repo_id: repo.clone(),
+            commit_id: right,
+        },
+    ) {
+        VcsResponse::Integrated { conflicts, .. } => conflicts,
+        other => panic!("{other:?}"),
+    };
+    (repo, id, conflicts)
+}
+
+fn read_working(conn: &Connection, host: &Host, repo: &str, id: &str) -> luvcs::api::VcsObjectView {
+    match run(
+        conn,
+        host,
+        VcsRequest::ReadObject {
+            repo_id: repo.into(),
+            object_id: id.into(),
+            commit_id: None,
+        },
+    ) {
+        VcsResponse::Object { object } => object,
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn concurrent_titles_conflict_and_resolve_with_a_title() {
+    let conn = Connection::open_in_memory().unwrap();
+    let host = host();
+    // The text merges (different lines); the titles do not.
+    let (repo, id, conflicts) =
+        diverge_and_integrate(&conn, &host, ("A2\nB\nC\n", "a.md"), ("A\nB\nC2\n", "b.md"));
+    assert_eq!(conflicts.len(), 1);
+    let c = &conflicts[0];
+    assert_eq!(c.driver, "merge.text.v1");
+    assert_eq!(c.merged_text.as_deref(), Some("A2\nB\nC2\n"));
+    assert_eq!(c.terms.len(), 1);
+    assert_eq!(c.terms[0].kind, "metadata");
+    assert_eq!(c.terms[0].path, "title");
+    assert_eq!(
+        c.terms[0].candidates,
+        vec![Some("a.md".to_owned()), Some("b.md".to_owned())]
+    );
+    // Neither title is picked for the conflict state.
+    assert_eq!(read_working(&conn, &host, &repo, &id).title, None);
+
+    let resolve = |title: Option<&str>| {
+        execute(
+            &conn,
+            &host.ctx(),
+            VcsRequest::Resolve {
+                repo_id: repo.clone(),
+                object_id: id.clone(),
+                resolution: VcsResolution::Text {
+                    text: "A2\nB\nC2\n".into(),
+                    title: title.map(str::to_owned),
+                },
+            },
+        )
+    };
+    match resolve(None) {
+        VcsResponse::Error { error } => assert_eq!(error.code, VcsErrorCode::Invalid),
+        other => panic!("{other:?}"),
+    }
+    match resolve(Some("c.md")) {
+        VcsResponse::Object { object } => {
+            assert_eq!(object.title.as_deref(), Some("c.md"));
+            assert_eq!(object.text.as_deref(), Some("A2\nB\nC2\n"));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn rename_on_one_side_and_edit_on_the_other_merge_cleanly() {
+    let conn = Connection::open_in_memory().unwrap();
+    let host = host();
+    let (repo, id, conflicts) = diverge_and_integrate(
+        &conn,
+        &host,
+        ("A\nB\nC\n", "moved.md"),
+        ("A\nB\nC2\n", "n.md"),
+    );
+    assert!(conflicts.is_empty(), "{conflicts:?}");
+    let object = read_working(&conn, &host, &repo, &id);
+    assert_eq!(object.title.as_deref(), Some("moved.md"));
+    assert_eq!(object.text.as_deref(), Some("A\nB\nC2\n"));
+}
+
+#[test]
+fn resolving_a_content_conflict_keeps_the_agreed_title() {
+    let conn = Connection::open_in_memory().unwrap();
+    let host = host();
+    let (repo, id, conflicts) = diverge_and_integrate(
+        &conn,
+        &host,
+        ("A\nB-l\nC\n", "n.md"),
+        ("A\nB-r\nC\n", "n.md"),
+    );
+    assert_eq!(conflicts.len(), 1);
+    assert!(conflicts[0].terms.iter().all(|t| t.kind == "text_region"));
+    assert_eq!(
+        read_working(&conn, &host, &repo, &id).title.as_deref(),
+        Some("n.md")
+    );
+    match run(
+        &conn,
+        &host,
+        VcsRequest::Resolve {
+            repo_id: repo,
+            object_id: id,
+            resolution: VcsResolution::Text {
+                text: "A\nB\nC\n".into(),
+                title: None,
+            },
+        },
+    ) {
+        VcsResponse::Object { object } => assert_eq!(object.title.as_deref(), Some("n.md")),
+        other => panic!("{other:?}"),
+    }
+}

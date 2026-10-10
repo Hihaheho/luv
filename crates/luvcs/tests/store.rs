@@ -501,6 +501,61 @@ fn integrate_refuses_unrecorded_changes_and_keeps_them() {
 }
 
 #[test]
+fn whole_object_conflict_still_reports_a_title_conflict() {
+    let conn = Connection::open_in_memory().unwrap();
+    let mut store = store(&conn);
+    let mut ctx = Ctx::new();
+    let mut repo = store.repo(REPO, key()).unwrap();
+    repo.create_workspace(WS, None).unwrap();
+    let title = |t: &str| Value::map([("title", Value::text(t)), ("kept", Value::text("k"))]);
+    let t0 = repo
+        .put_text_state(NOTE, "note", b"x\n", title("n.md"))
+        .unwrap();
+    repo.save_working(&ctx.next(WS, None), &[(NOTE, Some(t0))])
+        .unwrap();
+    let base = repo
+        .record(&ctx.next(WS, None), RecordSource::Working, "base")
+        .unwrap();
+    // The type changes on one side, so no content merge applies.
+    let tl = repo
+        .put_text_state(NOTE, "note", b"left\n", title("a.md"))
+        .unwrap();
+    repo.save_working(&ctx.next(WS, None), &[(NOTE, Some(tl))])
+        .unwrap();
+    repo.record(&ctx.next(WS, None), RecordSource::Working, "left")
+        .unwrap();
+    let ws2 = WorkspaceId([3; 16]);
+    repo.create_workspace(ws2, Some(base)).unwrap();
+    let tr = repo
+        .put_text_state(NOTE, "memo", b"right\n", title("b.md"))
+        .unwrap();
+    repo.save_working(&ctx.next(ws2, None), &[(NOTE, Some(tr))])
+        .unwrap();
+    let right = repo
+        .record(&ctx.next(ws2, None), RecordSource::Working, "right")
+        .unwrap();
+
+    let out = repo.integrate(&ctx.next(WS, None), right).unwrap();
+    assert_eq!(out.conflicts.len(), 1);
+    let conflict = repo.get_conflict(out.conflicts[0].1).unwrap();
+    assert_eq!(conflict.driver, "merge.object.v1");
+    let kinds: Vec<(TermKind, &str)> = conflict
+        .terms
+        .iter()
+        .map(|t| (t.kind, t.path.as_str()))
+        .collect();
+    assert_eq!(
+        kinds,
+        vec![(TermKind::Value, ""), (TermKind::Metadata, "title")]
+    );
+    // The conflict state keeps the agreed key and drops the disputed one.
+    let working = repo.working_entries(WS).unwrap()[&NOTE];
+    let metadata = repo.get_state(working).unwrap().metadata;
+    assert_eq!(metadata.get("kept").and_then(Value::as_text), Some("k"));
+    assert_eq!(metadata.get("title"), None);
+}
+
+#[test]
 fn deleted_vs_edited_is_a_conflict_and_restore_brings_old_content_back() {
     let conn = Connection::open_in_memory().unwrap();
     let mut store = store(&conn);

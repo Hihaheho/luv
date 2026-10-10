@@ -171,14 +171,21 @@ pub enum VcsRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum VcsResolution {
     /// Take one side of the conflict whole (0 = ours / left, 1 = theirs).
-    Side {
-        index: u32,
-    },
+    Side { index: u32 },
+    /// Give the content. The resolved object keeps the metadata both sides
+    /// agree on; `title` sets the title, and is required when the title is
+    /// itself in conflict.
     Text {
         text: String,
+        #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
+        title: Option<String>,
     },
     Record {
         record_json: String,
+        #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
+        title: Option<String>,
     },
 }
 
@@ -395,9 +402,11 @@ pub struct VcsObjectView {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VcsConflictTermView {
     pub path: String,
-    /// `value`, `order`, `deleted_vs_edited`, `text_region`.
+    /// `value`, `order`, `deleted_vs_edited`, `text_region`, `metadata`
+    /// (`path` is then the metadata key, e.g. `title`).
     pub kind: String,
-    /// One candidate per side: text for text states, JSON for record states.
+    /// One candidate per side: text for text states, JSON for record states,
+    /// the value for a text metadata key.
     /// `None` when that side has no content (including deletion).
     pub candidates: Vec<Option<String>>,
 }

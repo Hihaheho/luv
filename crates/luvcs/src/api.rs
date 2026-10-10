@@ -367,15 +367,6 @@ fn title_of(state: &ObjectState) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn term_kind(kind: &TermKind) -> &'static str {
-    match kind {
-        TermKind::Value => "value",
-        TermKind::Order => "order",
-        TermKind::DeletedVsEdited => "deleted_vs_edited",
-        TermKind::TextRegion => "text_region",
-    }
-}
-
 fn actor_kind(kind: &ActorKind) -> &'static str {
     match kind {
         ActorKind::User => "user",
@@ -477,6 +468,16 @@ impl<D: Digest> Session<'_, '_, '_, D> {
             .transpose()
     }
 
+    /// A metadata candidate as text; `None` for a value that is not text.
+    fn content_metadata_text(&self, id: crate::id::ContentId) -> ApiResult<Option<String>> {
+        let Some(bytes) = self.repo.get_content(id)? else {
+            return Ok(None);
+        };
+        let value = crate::cbor::decode(&bytes)
+            .map_err(|e| VcsError::new(VcsErrorCode::Internal, e.to_string()))?;
+        Ok(value.as_text().map(str::to_owned))
+    }
+
     fn state_text(&self, id: ObjectStateId) -> ApiResult<Option<String>> {
         let state = self.repo.get_state(id)?;
         Ok(match state.body {
@@ -501,6 +502,7 @@ impl<D: Digest> Session<'_, '_, '_, D> {
             let mut candidates = Vec::with_capacity(t.candidates.len());
             for (index, cand) in t.candidates.iter().enumerate() {
                 candidates.push(match cand {
+                    Some(id) if t.kind == TermKind::Metadata => self.content_metadata_text(*id)?,
                     Some(id) => {
                         let is_record = c.driver == "merge.record.v1"
                             || c.sides
@@ -519,7 +521,7 @@ impl<D: Digest> Session<'_, '_, '_, D> {
             }
             terms.push(VcsConflictTermView {
                 path: t.path.clone(),
-                kind: term_kind(&t.kind).to_owned(),
+                kind: t.kind.as_str().to_owned(),
                 candidates,
             });
         }
@@ -950,18 +952,51 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                     return Err(VcsError::invalid(format!("object {id} is not in conflict")));
                 };
                 let conflict = self.repo.get_conflict(conflict)?;
+                // Given content keeps the metadata the sides agree on (the
+                // conflict state carries it); a key in conflict needs a value.
+                let resolved_metadata = |title: Option<String>| -> ApiResult<Value> {
+                    for t in conflict
+                        .terms
+                        .iter()
+                        .filter(|t| t.kind == TermKind::Metadata)
+                    {
+                        if t.path != "title" {
+                            return Err(VcsError::invalid(format!(
+                                "metadata {:?} is in conflict and cannot be given; take a side",
+                                t.path
+                            )));
+                        }
+                        if title.is_none() {
+                            return Err(VcsError::invalid(
+                                "the title is in conflict; give a title or take a side",
+                            ));
+                        }
+                    }
+                    let mut entries: Vec<(Value, Value)> = state
+                        .metadata
+                        .map_entries()
+                        .unwrap_or_default()
+                        .into_iter()
+                        .filter(|(k, _)| !(*k == "title" && title.is_some()))
+                        .map(|(k, v)| (Value::text(k), v.clone()))
+                        .collect();
+                    if let Some(t) = title {
+                        entries.push((Value::text("title"), Value::text(t)));
+                    }
+                    Ok(Value::Map(entries))
+                };
                 let resolved = match resolution {
                     VcsResolution::Side { index } => *conflict
                         .sides
                         .get(index as usize)
                         .ok_or_else(|| VcsError::invalid("no such side"))?,
-                    VcsResolution::Text { text } => self.repo.put_text_state(
+                    VcsResolution::Text { text, title } => self.repo.put_text_state(
                         id,
                         &state.type_id,
                         text.as_bytes(),
-                        state.metadata.clone(),
+                        resolved_metadata(title)?,
                     )?,
-                    VcsResolution::Record { record_json } => {
+                    VcsResolution::Record { record_json, title } => {
                         let record = record_from_json(&record_json)?;
                         let schema = conflict
                             .sides
@@ -976,7 +1011,7 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                             &state.type_id,
                             &schema,
                             &record,
-                            state.metadata.clone(),
+                            resolved_metadata(title)?,
                         )?
                     }
                 };

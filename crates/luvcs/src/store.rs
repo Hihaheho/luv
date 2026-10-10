@@ -2032,7 +2032,54 @@ impl<D: Digest> Executor<'_, '_, D> {
             });
         }
 
+        // Metadata merges key-wise beside the body; the conflict state keeps
+        // the agreed keys so a resolution by content does not lose them.
+        let meta = match (&ls, &rs) {
+            (Some(l), Some(r)) => {
+                merge_metadata(&l.metadata, &r.metadata, bs.as_ref().map(|b| &b.metadata))
+            }
+            (Some(s), None) | (None, Some(s)) => MetadataMerge {
+                merged: s.metadata.clone(),
+                conflicts: vec![],
+            },
+            (None, None) => MetadataMerge {
+                merged: Value::Map(vec![]),
+                conflicts: vec![],
+            },
+        };
+
+        // The body changed on at most one side (only metadata moved on the
+        // other): that body is taken whole, whatever its type.
+        let one_sided_body = match (&ls, &rs) {
+            (Some(l), Some(r)) if !ambiguous_base && l.type_id == r.type_id => {
+                if l.body == r.body || bs.as_ref().is_some_and(|b| b.body == r.body) {
+                    Some(l.body.clone())
+                } else if bs.as_ref().is_some_and(|b| b.body == l.body) {
+                    Some(r.body.clone())
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
         let (driver, outcome) = match (&ls, &rs) {
+            (Some(l), Some(_)) if one_sided_body.is_some() => {
+                let body = one_sided_body.expect("checked by the guard");
+                if meta.conflicts.is_empty() {
+                    let state =
+                        ObjectState::new(object_id, &l.type_id, body).with_metadata(meta.merged);
+                    return Ok(ObjectMerge::Keep(Some(self.put_state(&state)?)));
+                }
+                let terms = self.metadata_terms(&meta.conflicts)?;
+                match body {
+                    ObjectBody::Text { content } => (TEXT_DRIVER_V1, (Some(content), terms)),
+                    ObjectBody::Record { content, .. } => {
+                        (RECORD_DRIVER_V1, (Some(content), terms))
+                    }
+                    _ => ("merge.object.v1", (None, terms)),
+                }
+            }
             (Some(l), Some(r)) if !ambiguous_base => {
                 match (&l.body, &r.body, bs.as_ref().map(|b| &b.body)) {
                     (
@@ -2049,18 +2096,19 @@ impl<D: Digest> Executor<'_, '_, D> {
                         match merge::text::merge_text(base_bytes.as_deref(), &lb, &rb) {
                             merge::text::TextMergeOutcome::Merged(bytes) => {
                                 let content = self.put_content(&bytes)?;
-                                let state = ObjectState::new(
-                                    object_id,
-                                    &l.type_id,
-                                    ObjectBody::Text { content },
-                                )
-                                .with_metadata(merge_metadata(
-                                    &l.metadata,
-                                    &r.metadata,
-                                    bs.as_ref().map(|b| &b.metadata),
-                                ));
-                                let id = self.put_state(&state)?;
-                                return Ok(ObjectMerge::Keep(Some(id)));
+                                if !meta.conflicts.is_empty() {
+                                    let terms = self.metadata_terms(&meta.conflicts)?;
+                                    (TEXT_DRIVER_V1, (Some(content), terms))
+                                } else {
+                                    let state = ObjectState::new(
+                                        object_id,
+                                        &l.type_id,
+                                        ObjectBody::Text { content },
+                                    )
+                                    .with_metadata(meta.merged);
+                                    let id = self.put_state(&state)?;
+                                    return Ok(ObjectMerge::Keep(Some(id)));
+                                }
                             }
                             merge::text::TextMergeOutcome::Conflicted { merged, regions } => {
                                 let merged_id = self.put_content(&merged)?;
@@ -2074,6 +2122,7 @@ impl<D: Digest> Executor<'_, '_, D> {
                                         candidates: vec![Some(lc), Some(rc)],
                                     });
                                 }
+                                terms.extend(self.metadata_terms(&meta.conflicts)?);
                                 (TEXT_DRIVER_V1, (Some(merged_id), terms))
                             }
                         }
@@ -2105,21 +2154,22 @@ impl<D: Digest> Executor<'_, '_, D> {
                         match merge::record::merge_record(&schema, base_rec.as_ref(), &lr, &rr) {
                             merge::record::RecordMergeOutcome::Merged(v) => {
                                 let content = self.put_content(&v.encode()?)?;
-                                let state = ObjectState::new(
-                                    object_id,
-                                    &l.type_id,
-                                    ObjectBody::Record {
-                                        content,
-                                        schema: ls_.clone(),
-                                    },
-                                )
-                                .with_metadata(merge_metadata(
-                                    &l.metadata,
-                                    &r.metadata,
-                                    bs.as_ref().map(|b| &b.metadata),
-                                ));
-                                let id = self.put_state(&state)?;
-                                return Ok(ObjectMerge::Keep(Some(id)));
+                                if !meta.conflicts.is_empty() {
+                                    let terms = self.metadata_terms(&meta.conflicts)?;
+                                    (RECORD_DRIVER_V1, (Some(content), terms))
+                                } else {
+                                    let state = ObjectState::new(
+                                        object_id,
+                                        &l.type_id,
+                                        ObjectBody::Record {
+                                            content,
+                                            schema: ls_.clone(),
+                                        },
+                                    )
+                                    .with_metadata(meta.merged);
+                                    let id = self.put_state(&state)?;
+                                    return Ok(ObjectMerge::Keep(Some(id)));
+                                }
                             }
                             merge::record::RecordMergeOutcome::Conflicted {
                                 merged,
@@ -2143,11 +2193,16 @@ impl<D: Digest> Executor<'_, '_, D> {
                                         candidates: cands,
                                     });
                                 }
+                                terms.extend(self.metadata_terms(&meta.conflicts)?);
                                 (RECORD_DRIVER_V1, (Some(merged_id), terms))
                             }
                         }
                     }
-                    _ => ("merge.object.v1", (None, vec![whole_object_term(&ls, &rs)])),
+                    _ => {
+                        let mut terms = vec![whole_object_term(&ls, &rs)];
+                        terms.extend(self.metadata_terms(&meta.conflicts)?);
+                        ("merge.object.v1", (None, terms))
+                    }
                 }
             }
             _ => {
@@ -2158,7 +2213,9 @@ impl<D: Digest> Executor<'_, '_, D> {
                 };
                 let mut term = whole_object_term(&ls, &rs);
                 term.kind = kind;
-                ("merge.object.v1", (None, vec![term]))
+                let mut terms = vec![term];
+                terms.extend(self.metadata_terms(&meta.conflicts)?);
+                ("merge.object.v1", (None, terms))
             }
         };
         let (merged, terms) = outcome;
@@ -2178,9 +2235,33 @@ impl<D: Digest> Executor<'_, '_, D> {
             ObjectBody::Conflict {
                 conflict: conflict_id,
             },
-        );
+        )
+        .with_metadata(meta.merged);
         let state_id = self.put_state(&state)?;
         Ok(ObjectMerge::Conflict(state_id, conflict_id))
+    }
+
+    /// One `Metadata` term per key both sides changed differently.
+    fn metadata_terms(
+        &mut self,
+        conflicts: &[(String, Option<Value>, Option<Value>)],
+    ) -> Result<Vec<ConflictTerm>> {
+        let mut terms = Vec::with_capacity(conflicts.len());
+        for (key, l, r) in conflicts {
+            let mut candidates = Vec::with_capacity(2);
+            for side in [l, r] {
+                candidates.push(match side {
+                    Some(v) => Some(self.put_content(&cbor::encode(v))?),
+                    None => None,
+                });
+            }
+            terms.push(ConflictTerm {
+                path: key.clone(),
+                kind: TermKind::Metadata,
+                candidates,
+            });
+        }
+        Ok(terms)
     }
 }
 
@@ -2202,26 +2283,45 @@ fn whole_object_term(l: &Option<ObjectState>, r: &Option<ObjectState>) -> Confli
     }
 }
 
-/// Metadata merge: key-wise, one side changed wins, both changed → left
-/// (metadata is display-only; the content conflict is what the user sees).
-fn merge_metadata(l: &Value, r: &Value, base: Option<&Value>) -> Value {
+/// The key-wise merge of two sides' metadata.
+struct MetadataMerge {
+    /// Every key the sides agree on, or that only one side changed.
+    merged: Value,
+    /// Keys both sides changed differently: (key, left value, right value),
+    /// `None` where that side removed the key.
+    conflicts: Vec<(String, Option<Value>, Option<Value>)>,
+}
+
+/// Metadata merge: key-wise, a key one side changed takes that side's
+/// value; a key both sides changed differently is a conflict, never a
+/// silent pick (a title is a path to the CLI, not decoration).
+fn merge_metadata(l: &Value, r: &Value, base: Option<&Value>) -> MetadataMerge {
     let lm = l.map_entries().unwrap_or_default();
     let rm = r.map_entries().unwrap_or_default();
     let bm = base.and_then(Value::map_entries).unwrap_or_default();
     let keys: BTreeSet<&str> = lm.keys().chain(rm.keys()).copied().collect();
-    let mut out = Vec::new();
+    let mut merged = Vec::new();
+    let mut conflicts = Vec::new();
     for k in keys {
         let (lv, rv, bv) = (lm.get(k), rm.get(k), bm.get(k));
-        let pick = if lv == rv {
+        let pick = if lv == rv || rv == bv {
             lv
         } else if lv == bv {
             rv
         } else {
-            lv
+            conflicts.push((
+                k.to_owned(),
+                lv.map(|v| (*v).clone()),
+                rv.map(|v| (*v).clone()),
+            ));
+            continue;
         };
         if let Some(v) = pick {
-            out.push((Value::text(k), (*v).clone()));
+            merged.push((Value::text(k), (*v).clone()));
         }
     }
-    Value::Map(out)
+    MetadataMerge {
+        merged: Value::Map(merged),
+        conflicts,
+    }
 }
