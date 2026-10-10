@@ -57,6 +57,8 @@ pub enum StoreError {
     IdentityConflict { id: String },
     #[error("nothing to record: the snapshot equals the base")]
     NothingToRecord,
+    #[error("the working tree has unrecorded changes; record them first")]
+    UnrecordedChanges,
     #[error("workspace has no candidate")]
     NoCandidate,
     #[error("nothing to undo")]
@@ -1214,7 +1216,8 @@ impl<D: Digest> Repo<'_, '_, D> {
     /// snapshot and `other`'s snapshot against their common ancestor. The
     /// result is a merge commit with parents `[base, other]`; objects that
     /// did not merge carry a `Conflict` state. The working tree moves to the
-    /// merge result.
+    /// merge result, so a working tree that differs from the base is refused
+    /// rather than overwritten.
     pub fn integrate(
         &mut self,
         ctx: &OperationContext,
@@ -1228,6 +1231,9 @@ impl<D: Digest> Repo<'_, '_, D> {
                 return Err(StoreError::Invalid(
                     "cannot integrate a commit into itself".into(),
                 ));
+            }
+            if ws.working != exec.commit(base)?.root {
+                return Err(StoreError::UnrecordedChanges);
             }
             let ancestors = exec.merge_bases(base, other)?;
             let left = exec.tree_entries(exec.commit(base)?.root)?;

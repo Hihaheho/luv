@@ -84,6 +84,7 @@ impl From<StoreError> for VcsError {
             StoreError::StaleToken { .. } => "stale",
             StoreError::RepoExists(_) | StoreError::IdentityConflict { .. } => "conflict",
             StoreError::NothingToRecord => "nothing_to_record",
+            StoreError::UnrecordedChanges => "unrecorded_changes",
             StoreError::Core(crate::model::CoreError::Unsupported { .. }) => "unsupported",
             StoreError::Invalid(_) | StoreError::Record(_) | StoreError::Cbor(_) => "invalid",
             StoreError::Sqlite(_) | StoreError::Digest(_) => "internal",

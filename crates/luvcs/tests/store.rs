@@ -455,6 +455,52 @@ fn integrate_merges_text_and_records_and_stores_structured_conflicts() {
 }
 
 #[test]
+fn integrate_refuses_unrecorded_changes_and_keeps_them() {
+    let conn = Connection::open_in_memory().unwrap();
+    let mut store = store(&conn);
+    let mut ctx = Ctx::new();
+    let mut repo = store.repo(REPO, key()).unwrap();
+    repo.create_workspace(WS, None).unwrap();
+    let t0 = repo
+        .put_text_state(NOTE, "note", b"x\n", Value::Map(vec![]))
+        .unwrap();
+    repo.save_working(&ctx.next(WS, None), &[(NOTE, Some(t0))])
+        .unwrap();
+    let base = repo
+        .record(&ctx.next(WS, None), RecordSource::Working, "base")
+        .unwrap();
+    let ws2 = WorkspaceId([3; 16]);
+    repo.create_workspace(ws2, Some(base)).unwrap();
+    let t_r = repo
+        .put_text_state(OTHER, "note", b"right\n", Value::Map(vec![]))
+        .unwrap();
+    repo.save_working(&ctx.next(ws2, None), &[(OTHER, Some(t_r))])
+        .unwrap();
+    let right = repo
+        .record(&ctx.next(ws2, None), RecordSource::Working, "right")
+        .unwrap();
+
+    let dirty = repo
+        .put_text_state(NOTE, "note", b"unrecorded\n", Value::Map(vec![]))
+        .unwrap();
+    repo.save_working(&ctx.next(WS, None), &[(NOTE, Some(dirty))])
+        .unwrap();
+    let err = repo.integrate(&ctx.next(WS, None), right).unwrap_err();
+    assert!(matches!(err, StoreError::UnrecordedChanges), "{err:?}");
+    assert_eq!(repo.working_entries(WS).unwrap()[&NOTE], dirty);
+    assert_eq!(repo.workspace(WS).unwrap().base, Some(base));
+
+    // Once recorded, the same integrate goes through.
+    repo.record(&ctx.next(WS, None), RecordSource::Working, "left")
+        .unwrap();
+    let out = repo.integrate(&ctx.next(WS, None), right).unwrap();
+    assert!(out.conflicts.is_empty());
+    let working = repo.working_entries(WS).unwrap();
+    assert_eq!(working[&NOTE], dirty);
+    assert_eq!(working[&OTHER], t_r);
+}
+
+#[test]
 fn deleted_vs_edited_is_a_conflict_and_restore_brings_old_content_back() {
     let conn = Connection::open_in_memory().unwrap();
     let mut store = store(&conn);
