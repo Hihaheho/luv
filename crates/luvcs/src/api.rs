@@ -41,13 +41,13 @@ pub struct HostContext<'a> {
 impl HostContext<'_> {
     pub(crate) fn random_16(&self) -> Result<[u8; 16], VcsError> {
         let mut out = [0u8; 16];
-        (self.random)(&mut out).map_err(|m| VcsError::new("host", m))?;
+        (self.random)(&mut out).map_err(|m| VcsError::new(VcsErrorCode::Host, m))?;
         Ok(out)
     }
 
     fn random_32(&self) -> Result<[u8; 32], VcsError> {
         let mut out = [0u8; 32];
-        (self.random)(&mut out).map_err(|m| VcsError::new("host", m))?;
+        (self.random)(&mut out).map_err(|m| VcsError::new(VcsErrorCode::Host, m))?;
         Ok(out)
     }
 
@@ -80,15 +80,27 @@ impl From<StoreError> for VcsError {
             | StoreError::UnknownWorkspace(_)
             | StoreError::UnknownCommit(_)
             | StoreError::MissingObject { .. }
-            | StoreError::UnknownBinding(_) => "not_found",
-            StoreError::StaleToken { .. } => "stale",
-            StoreError::RepoExists(_) | StoreError::IdentityConflict { .. } => "conflict",
-            StoreError::NothingToRecord => "nothing_to_record",
-            StoreError::UnrecordedChanges => "unrecorded_changes",
-            StoreError::Core(crate::model::CoreError::Unsupported { .. }) => "unsupported",
-            StoreError::Invalid(_) | StoreError::Record(_) | StoreError::Cbor(_) => "invalid",
-            StoreError::Sqlite(_) | StoreError::Digest(_) => "internal",
-            _ => "invalid",
+            | StoreError::UnknownBinding(_) => VcsErrorCode::NotFound,
+            StoreError::StaleToken { .. } => VcsErrorCode::Stale,
+            StoreError::RepoExists(_) | StoreError::IdentityConflict { .. } => {
+                VcsErrorCode::Conflict
+            }
+            StoreError::NothingToRecord => VcsErrorCode::NothingToRecord,
+            StoreError::UnrecordedChanges => VcsErrorCode::UnrecordedChanges,
+            StoreError::Core(crate::model::CoreError::Unsupported { .. }) => {
+                VcsErrorCode::Unsupported
+            }
+            StoreError::Sqlite(_) | StoreError::Digest(_) => VcsErrorCode::Internal,
+            StoreError::Invalid(_)
+            | StoreError::Record(_)
+            | StoreError::Cbor(_)
+            | StoreError::Core(_)
+            | StoreError::Tree(_)
+            | StoreError::NoCandidate
+            | StoreError::NothingToUndo
+            | StoreError::NothingToRedo
+            | StoreError::UnknownSchema(_)
+            | StoreError::DuplicateOperation(_) => VcsErrorCode::Invalid,
         };
         Self::new(code, e.to_string())
     }
@@ -96,13 +108,13 @@ impl From<StoreError> for VcsError {
 
 impl From<rusqlite::Error> for VcsError {
     fn from(e: rusqlite::Error) -> Self {
-        Self::new("internal", e.to_string())
+        Self::new(VcsErrorCode::Internal, e.to_string())
     }
 }
 
 impl From<DigestError> for VcsError {
     fn from(e: DigestError) -> Self {
-        Self::new("host", e.to_string())
+        Self::new(VcsErrorCode::Host, e.to_string())
     }
 }
 
@@ -110,11 +122,11 @@ impl From<blob_store::BlobStoreError> for VcsError {
     fn from(e: blob_store::BlobStoreError) -> Self {
         use blob_store::BlobStoreError as E;
         let code = match &e {
-            E::NotFound(..) => "not_found",
-            E::Blob(crate::blob::BlobError::Limit(_)) => "unsupported",
-            E::Blob(crate::blob::BlobError::Digest(_)) => "host",
-            E::Blob(_) => "invalid",
-            E::Sqlite(_) | E::Corrupt(..) => "internal",
+            E::NotFound(..) => VcsErrorCode::NotFound,
+            E::Blob(crate::blob::BlobError::Limit(_)) => VcsErrorCode::Unsupported,
+            E::Blob(crate::blob::BlobError::Digest(_)) => VcsErrorCode::Host,
+            E::Blob(_) => VcsErrorCode::Invalid,
+            E::Sqlite(_) | E::Corrupt(..) => VcsErrorCode::Internal,
         };
         Self::new(code, e.to_string())
     }
@@ -183,7 +195,7 @@ pub(crate) fn local_repos(conn: &Connection) -> ApiResult<Vec<LocalRepo>> {
     let mut out = Vec::new();
     for row in rows {
         let (repo, name, key, ws, created) = row?;
-        let bad = |m: String| VcsError::new("internal", m);
+        let bad = |m: String| VcsError::new(VcsErrorCode::Internal, m);
         let key: [u8; 32] = key
             .try_into()
             .map_err(|_| bad("stored ID key is not 32 bytes".into()))?;
@@ -203,7 +215,12 @@ pub(crate) fn local_repo(conn: &Connection, repo_id: &str) -> ApiResult<LocalRep
     local_repos(conn)?
         .into_iter()
         .find(|r| r.repo_id == id)
-        .ok_or_else(|| VcsError::new("not_found", format!("repo {id} is not on this device")))
+        .ok_or_else(|| {
+            VcsError::new(
+                VcsErrorCode::NotFound,
+                format!("repo {id} is not on this device"),
+            )
+        })
 }
 
 fn record_from_json_value(v: &serde_json::Value) -> ApiResult<RecordValue> {
@@ -423,9 +440,9 @@ impl<D: Digest> Session<'_, '_, '_, D> {
 
     fn blob_ref_view(&self, blob: &BlobRef) -> ApiResult<VcsBlobRefView> {
         let realm_id = RealmId::from_bytes(&blob.realm_id)
-            .map_err(|e| VcsError::new("internal", e.to_string()))?;
+            .map_err(|e| VcsError::new(VcsErrorCode::Internal, e.to_string()))?;
         let blob_id = BlobId::from_bytes(&blob.blob_id)
-            .map_err(|e| VcsError::new("internal", e.to_string()))?;
+            .map_err(|e| VcsError::new(VcsErrorCode::Internal, e.to_string()))?;
         let present = blob_store::stat(self.repo.connection(), realm_id, blob_id)?.is_some();
         Ok(VcsBlobRefView {
             realm_id: realm_id.to_string(),
@@ -439,7 +456,10 @@ impl<D: Digest> Session<'_, '_, '_, D> {
         let realm = self.realm();
         let id: BlobId = parse("blob id", blob_id)?;
         let info = blob_store::stat(self.repo.connection(), realm.id, id)?.ok_or_else(|| {
-            VcsError::new("not_found", format!("blob {id} is not on this device"))
+            VcsError::new(
+                VcsErrorCode::NotFound,
+                format!("blob {id} is not on this device"),
+            )
         })?;
         Ok((realm.id, id, blob_info_view(&info)))
     }
@@ -449,9 +469,9 @@ impl<D: Digest> Session<'_, '_, '_, D> {
             .get_content(id)?
             .map(|bytes| {
                 let value = crate::cbor::decode(&bytes)
-                    .map_err(|e| VcsError::new("internal", e.to_string()))?;
+                    .map_err(|e| VcsError::new(VcsErrorCode::Internal, e.to_string()))?;
                 let record = RecordValue::from_cbor(&value)
-                    .map_err(|e| VcsError::new("internal", e.to_string()))?;
+                    .map_err(|e| VcsError::new(VcsErrorCode::Internal, e.to_string()))?;
                 Ok(record_to_json(&record).to_string())
             })
             .transpose()
@@ -549,7 +569,7 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                 view.schema_id = Some(schema.clone());
                 if let Some(bytes) = self.repo.get_content(*content)? {
                     let record = RecordValue::decode(&bytes)
-                        .map_err(|e| VcsError::new("internal", e.to_string()))?;
+                        .map_err(|e| VcsError::new(VcsErrorCode::Internal, e.to_string()))?;
                     view.record_json = Some(record_to_json(&record).to_string());
                 }
             }
@@ -821,7 +841,10 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                 let id: ObjectId = parse("object id", &object_id)?;
                 let entries = self.entries_at(commit_id.as_deref())?;
                 let state = entries.get(&id).copied().ok_or_else(|| {
-                    VcsError::new("not_found", format!("object {id} is not in this snapshot"))
+                    VcsError::new(
+                        VcsErrorCode::NotFound,
+                        format!("object {id} is not in this snapshot"),
+                    )
                 })?;
                 VcsResponse::Object {
                     object: self.object_view(id, state)?,
@@ -918,7 +941,7 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                 let working = self.repo.tree_entries(ws.working)?;
                 let current = working.get(&id).copied().ok_or_else(|| {
                     VcsError::new(
-                        "not_found",
+                        VcsErrorCode::NotFound,
                         format!("object {id} is not in the working tree"),
                     )
                 })?;
@@ -1085,7 +1108,7 @@ pub(crate) fn insert_local_repo(conn: &Connection, local: &LocalRepo) -> ApiResu
     )?;
     if n == 0 {
         return Err(VcsError::new(
-            "conflict",
+            VcsErrorCode::Conflict,
             format!("repo {} is already on this device", local.repo_id),
         ));
     }
@@ -1158,7 +1181,7 @@ fn execute_inner(
                 .ok_or_else(|| VcsError::invalid("archive: repo id missing"))?;
             if local_repos(conn)?.iter().any(|r| r.repo_id == repo_id) {
                 return Err(VcsError::new(
-                    "conflict",
+                    VcsErrorCode::Conflict,
                     format!("repo {repo_id} is already on this device"),
                 ));
             }

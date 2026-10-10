@@ -274,25 +274,61 @@ pub struct VcsBlobRefView {
     pub present: bool,
 }
 
+/// What kind of failure a `VcsError` reports; serialized as snake_case.
+#[luv_ffi]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum VcsErrorCode {
+    Invalid,
+    NotFound,
+    Stale,
+    NothingToRecord,
+    UnrecordedChanges,
+    Conflict,
+    Unsupported,
+    Host,
+    Internal,
+}
+
+impl VcsErrorCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Invalid => "invalid",
+            Self::NotFound => "not_found",
+            Self::Stale => "stale",
+            Self::NothingToRecord => "nothing_to_record",
+            Self::UnrecordedChanges => "unrecorded_changes",
+            Self::Conflict => "conflict",
+            Self::Unsupported => "unsupported",
+            Self::Host => "host",
+            Self::Internal => "internal",
+        }
+    }
+}
+
+impl std::fmt::Display for VcsErrorCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 #[luv_ffi]
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VcsError {
-    /// `invalid`, `not_found`, `stale`, `nothing_to_record`, `conflict`,
-    /// `unsupported`, `host`, `internal`.
-    pub code: String,
+    pub code: VcsErrorCode,
     pub message: String,
 }
 
 impl VcsError {
-    pub fn new(code: &str, message: impl Into<String>) -> Self {
+    pub fn new(code: VcsErrorCode, message: impl Into<String>) -> Self {
         Self {
-            code: code.into(),
+            code,
             message: message.into(),
         }
     }
 
     pub fn invalid(message: impl Into<String>) -> Self {
-        Self::new("invalid", message)
+        Self::new(VcsErrorCode::Invalid, message)
     }
 }
 

@@ -6,7 +6,8 @@ use std::cell::Cell;
 use std::rc::Rc;
 
 use luvcs::api::{
-    HostContext, VcsRequest, VcsResolution, VcsResponse, execute, record_from_json, record_to_json,
+    HostContext, VcsError, VcsErrorCode, VcsRequest, VcsResolution, VcsResponse, execute,
+    record_from_json, record_to_json,
 };
 use luvcs::digest::RustDigest;
 use luvcs::model::ActorKind;
@@ -245,7 +246,7 @@ fn text_lifecycle_record_log_undo() {
             commit_id: "cmt_nope".into(),
         },
     ) {
-        VcsResponse::Error { error } => assert_eq!(error.code, "invalid"),
+        VcsResponse::Error { error } => assert_eq!(error.code, VcsErrorCode::Invalid),
         other => panic!("{other:?}"),
     }
     match execute(
@@ -255,7 +256,7 @@ fn text_lifecycle_record_log_undo() {
             repo_id: "repo_AAAAAAAAAAAAAAAAAAAAAA".into(),
         },
     ) {
-        VcsResponse::Error { error } => assert_eq!(error.code, "not_found"),
+        VcsResponse::Error { error } => assert_eq!(error.code, VcsErrorCode::NotFound),
         other => panic!("{other:?}"),
     }
 
@@ -304,7 +305,7 @@ fn text_lifecycle_record_log_undo() {
             id_key_base64: key,
         },
     ) {
-        VcsResponse::Error { error } => assert_eq!(error.code, "conflict"),
+        VcsResponse::Error { error } => assert_eq!(error.code, VcsErrorCode::Conflict),
         other => panic!("{other:?}"),
     }
     match run(&other, &host, VcsRequest::Heads { repo_id: copy }) {
@@ -322,7 +323,10 @@ fn record_json_round_trip_and_save() {
         back,
         serde_json::from_str::<serde_json::Value>(json).unwrap()
     );
-    assert_eq!(record_from_json("[1,2]").unwrap_err().code, "invalid");
+    assert_eq!(
+        record_from_json("[1,2]").unwrap_err().code,
+        VcsErrorCode::Invalid
+    );
 
     let conn = Connection::open_in_memory().unwrap();
     let host = host();
@@ -599,7 +603,7 @@ fn binary_objects_carry_local_blobs_through_export_and_import() {
             length: None,
         },
     ) {
-        VcsResponse::Error { error } => assert_eq!(error.code, "not_found"),
+        VcsResponse::Error { error } => assert_eq!(error.code, VcsErrorCode::NotFound),
         other => panic!("{other:?}"),
     }
 
@@ -832,4 +836,13 @@ fn record_conflict_and_historical_snapshots_are_readable() {
         }
         other => panic!("{other:?}"),
     }
+}
+
+#[test]
+fn error_codes_serialize_as_snake_case_strings() {
+    let error = VcsError::new(VcsErrorCode::UnrecordedChanges, "m");
+    let json = serde_json::to_value(&error).unwrap();
+    assert_eq!(json["code"], "unrecorded_changes");
+    assert_eq!(serde_json::from_value::<VcsError>(json).unwrap(), error);
+    assert_eq!(VcsErrorCode::NotFound.to_string(), "not_found");
 }
