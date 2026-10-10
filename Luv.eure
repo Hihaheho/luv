@@ -9,4 +9,5 @@ include = [
   ".gitignore",
   "Luv.eure",
   "crates/luvcs/tests/vectors/*.json",
+  ".github/workflows/ci.yml"
 ]
