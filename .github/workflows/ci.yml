@@ -1,0 +1,36 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+      - run: cargo test --workspace
+
+  # The host supplies SQLite: no `bundled-sqlite`, so rusqlite builds
+  # sqlite-wasm-rs on wasm32. Guards the "luvcs builds on wasm32" promise.
+  wasm32:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: stable
+          targets: wasm32-unknown-unknown
+      - run: >
+          cargo check -p luvcs
+          --no-default-features --features store,rust-digest
+          --target wasm32-unknown-unknown
+      - run: >
+          cargo check -p luvcs-protocol
+          --no-default-features --target wasm32-unknown-unknown

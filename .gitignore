@@ -18,3 +18,5 @@
 !/README.md
 !/README-ja.md
 !/Luv.eure
+
+!/.github/workflows/ci.yml
