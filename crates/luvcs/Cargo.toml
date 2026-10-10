@@ -1,0 +1,37 @@
+[package]
+name = "luvcs"
+description = "luv core: canonical encoding, keyed content IDs, snapshot trees, commits, merge drivers and the local store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+default = ["store", "rust-digest"]
+# SHA-256 / HMAC in Rust (`digest::RustDigest`). A host that supplies its own
+# `digest::Digest` (CryptoKit, WebCrypto) turns this off.
+rust-digest = ["dep:sha2", "dep:hmac"]
+# The rusqlite-backed local store and the request API on top of it.
+store = ["dep:rusqlite"]
+# TypeScript bindings of the API types.
+ts = ["dep:ts-rs"]
+# UniFFI bindings of the API types.
+uniffi = ["dep:uniffi"]
+
+[dependencies]
+luvcs-macros = { path = "../luvcs-macros" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true, optional = true }
+hmac = { workspace = true, optional = true }
+rusqlite = { workspace = true, optional = true }
+ts-rs = { workspace = true, optional = true }
+uniffi = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+sha2 = { workspace = true }
+hmac = { workspace = true }

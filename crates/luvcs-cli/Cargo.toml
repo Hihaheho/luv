@@ -1,0 +1,28 @@
+[package]
+name = "luvcs-cli"
+description = "luv: a work-tree CLI over luvcs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "luv"
+path = "src/main.rs"
+
+[dependencies]
+luvcs = { path = "../luvcs" }
+luvcs-protocol = { path = "../luvcs-protocol" }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+hex = { workspace = true }
+rusqlite = { workspace = true }
+getrandom = "0.3"
+eure = "0.1.6"
+globset = "0.4"
+similar = "2"
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = { workspace = true }

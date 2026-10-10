@@ -1,0 +1,19 @@
+[package]
+name = "luvcs-protocol"
+description = "Wire types between luvcs and a storage backend"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[features]
+ts = ["dep:ts-rs"]
+uniffi = ["dep:uniffi"]
+
+[dependencies]
+luvcs-macros = { path = "../luvcs-macros" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+eure = "0.1.6"
+ts-rs = { workspace = true, optional = true }
+uniffi = { workspace = true, optional = true }
