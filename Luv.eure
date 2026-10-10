@@ -1,0 +1,12 @@
+repo = "luv"
+include = [
+  "crates/**/*.rs",
+  "Cargo.toml",
+  "crates/*/Cargo.toml",
+  "Cargo.lock",
+  "README*.md",
+  "LICENSE-*",
+  ".gitignore",
+  "Luv.eure",
+  "crates/luvcs/tests/vectors/*.json",
+]
