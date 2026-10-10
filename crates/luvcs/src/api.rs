@@ -443,12 +443,24 @@ impl<D: Digest> Session<'_, '_, '_, D> {
         Ok((realm.id, id, blob_info_view(&info)))
     }
 
+    fn content_record_json(&self, id: crate::id::ContentId) -> ApiResult<Option<String>> {
+        self.repo
+            .get_content(id)?
+            .map(|bytes| {
+                let value = crate::cbor::decode(&bytes)
+                    .map_err(|e| VcsError::new("internal", e.to_string()))?;
+                let record = RecordValue::from_cbor(&value)
+                    .map_err(|e| VcsError::new("internal", e.to_string()))?;
+                Ok(record_to_json(&record).to_string())
+            })
+            .transpose()
+    }
+
     fn state_text(&self, id: ObjectStateId) -> ApiResult<Option<String>> {
         let state = self.repo.get_state(id)?;
         Ok(match state.body {
-            ObjectBody::Text { content } | ObjectBody::Record { content, .. } => {
-                self.content_text(content)?
-            }
+            ObjectBody::Text { content } => self.content_text(content)?,
+            ObjectBody::Record { content, .. } => self.content_record_json(content)?,
             _ => None,
         })
     }
@@ -466,9 +478,21 @@ impl<D: Digest> Session<'_, '_, '_, D> {
         let mut terms = Vec::with_capacity(c.terms.len());
         for t in &c.terms {
             let mut candidates = Vec::with_capacity(t.candidates.len());
-            for cand in &t.candidates {
+            for (index, cand) in t.candidates.iter().enumerate() {
                 candidates.push(match cand {
-                    Some(id) => self.content_text(*id)?,
+                    Some(id) => {
+                        let is_record = c.driver == "merge.record.v1"
+                            || c.sides
+                                .get(index)
+                                .map(|s| self.repo.get_state(*s))
+                                .transpose()?
+                                .is_some_and(|s| matches!(s.body, ObjectBody::Record { .. }));
+                        if is_record {
+                            self.content_record_json(*id)?
+                        } else {
+                            self.content_text(*id)?
+                        }
+                    }
                     None => None,
                 });
             }
@@ -482,9 +506,13 @@ impl<D: Digest> Session<'_, '_, '_, D> {
             object_id: object_id.to_string(),
             conflict_id: conflict_id.to_string(),
             driver: c.driver.clone(),
+            merged_record_json: match c.merged {
+                Some(m) if c.driver == "merge.record.v1" => self.content_record_json(m)?,
+                _ => None,
+            },
             merged_text: match c.merged {
-                Some(m) => self.content_text(m)?,
-                None => None,
+                Some(m) if c.driver != "merge.record.v1" => self.content_text(m)?,
+                _ => None,
             },
             sides,
             terms,
@@ -1188,4 +1216,61 @@ fn working_changes<D: Digest>(
         .collect();
     out.sort();
     Ok(out)
+}
+
+#[cfg(all(test, feature = "rust-digest"))]
+mod tests {
+    use super::*;
+    use crate::digest::RustDigest;
+    use crate::model::{CONFLICT_FORMAT_V1, Conflict, ConflictTerm};
+
+    #[test]
+    fn non_record_driver_keeps_merged_text() {
+        let conn = Connection::open_in_memory().unwrap();
+        let host = HostContext {
+            digest: &RustDigest,
+            random: &|out| {
+                out.fill(1);
+                Ok(())
+            },
+            now_unix_ms: 0,
+            device_id: "test".into(),
+            actor_kind: ActorKind::User,
+            schemas: SchemaRegistry::default(),
+        };
+        ensure_local_schema(&conn).unwrap();
+        let local = create_local_repo(&conn, &host, "test").unwrap();
+        let mut store = Store::open(&conn, &RustDigest).unwrap();
+        store.create_repo(local.repo_id, 0).unwrap();
+        let mut repo = store.repo(local.repo_id, local.key.clone()).unwrap();
+        let object_id = ObjectId([2; 16]);
+        let side = repo
+            .put_text_state(object_id, "text", b"side", Value::Map(vec![]))
+            .unwrap();
+        let merged = repo.put_content(b"provisional text").unwrap();
+        let conflict = Conflict {
+            format: CONFLICT_FORMAT_V1,
+            object_id,
+            driver: "merge.object.v1".into(),
+            base: vec![],
+            sides: vec![side, side],
+            merged: Some(merged),
+            terms: vec![ConflictTerm {
+                path: String::new(),
+                kind: TermKind::Value,
+                candidates: vec![Some(merged); 2],
+            }],
+        };
+        let id = conflict.id(&RustDigest, &local.key).unwrap();
+        repo.import_objects(&[("conflict".into(), id.to_vec(), conflict.encode().unwrap())])
+            .unwrap();
+        let session = Session {
+            repo: &mut repo,
+            local: &local,
+            host: &host,
+        };
+        let view = session.conflict_view(object_id, id).unwrap();
+        assert_eq!(view.merged_text.as_deref(), Some("provisional text"));
+        assert_eq!(view.merged_record_json, None);
+    }
 }

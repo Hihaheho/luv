@@ -7,12 +7,14 @@ license.workspace = true
 publish.workspace = true
 
 [features]
-default = ["store", "rust-digest"]
+default = ["store", "rust-digest", "bundled-sqlite"]
 # SHA-256 / HMAC in Rust (`digest::RustDigest`). A host that supplies its own
 # `digest::Digest` (CryptoKit, WebCrypto) turns this off.
 rust-digest = ["dep:sha2", "dep:hmac"]
 # The rusqlite-backed local store and the request API on top of it.
 store = ["dep:rusqlite"]
+# Optional SQLite implementation; disable defaults to supply SQLite in the host.
+bundled-sqlite = ["store", "rusqlite/bundled"]
 # TypeScript bindings of the API types.
 ts = ["dep:ts-rs"]
 # UniFFI bindings of the API types.

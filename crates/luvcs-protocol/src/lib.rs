@@ -27,6 +27,48 @@ pub const MAX_BLOB_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 /// Most entries one [`Request::Read`] may ask for.
 pub const MAX_READ_ENTRIES: u32 = 256;
 
+/// Default maximum number of entries in one atomic append.
+pub const MAX_APPEND_ENTRIES: u32 = MAX_READ_ENTRIES;
+
+/// Write limits. Byte counts exclude JSON/base64 overhead: entry bytes are
+/// the sum of decoded object payloads in an Objects entry. Other entry kinds
+/// have no byte limit in v1. Limits must be positive and stable for a log's
+/// lifetime, since blob chunk indices depend on the chunk size.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteLimits {
+    pub max_entry_bytes: u32,
+    pub max_blob_chunk_bytes: u32,
+    pub max_append_entries: u32,
+}
+
+impl Default for RemoteLimits {
+    fn default() -> Self {
+        Self {
+            max_entry_bytes: MAX_ENTRY_BYTES as u32,
+            max_blob_chunk_bytes: MAX_BLOB_CHUNK_BYTES as u32,
+            max_append_entries: MAX_APPEND_ENTRIES,
+        }
+    }
+}
+
+/// Standard error vocabulary. Unknown codes must be surfaced to the user,
+/// never automatically retried. Locked/unavailable mean the request made no
+/// changes and can be retried after a host-selected delay. Transport failures
+/// have an unknown outcome and are not classified as safe request retries.
+pub mod error_code {
+    pub const UNAUTHORIZED: &str = "unauthorized";
+    pub const LOCKED: &str = "locked";
+    pub const TOO_LARGE: &str = "too_large";
+    pub const UNAVAILABLE: &str = "unavailable";
+    pub const INVALID: &str = "invalid";
+    pub const UNSUPPORTED_PROTOCOL: &str = "unsupported_protocol";
+    pub const INTERNAL: &str = "internal";
+
+    pub fn is_retryable(code: &str) -> bool {
+        matches!(code, LOCKED | UNAVAILABLE)
+    }
+}
+
 /// How to reach a remote. Exactly one of the two fields is set.
 ///
 /// In `.luv/remote.eure`:
@@ -164,6 +206,9 @@ pub enum Response {
         protocol: u32,
         backend: String,
         head: u64,
+        /// Additive v1 capability: old peers omit this and use defaults.
+        #[serde(default)]
+        limits: RemoteLimits,
     },
     Head {
         head: u64,
@@ -189,6 +234,47 @@ pub enum Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_welcome_uses_default_limits() {
+        let response: Response =
+            serde_json::from_str(r#"{"type":"welcome","protocol":1,"backend":"old","head":0}"#)
+                .unwrap();
+        assert!(
+            matches!(response, Response::Welcome { limits, .. } if limits == RemoteLimits::default())
+        );
+        let current = Response::Welcome {
+            protocol: PROTOCOL_VERSION,
+            backend: "new".into(),
+            head: 0,
+            limits: RemoteLimits {
+                max_entry_bytes: 32,
+                max_blob_chunk_bytes: 16,
+                max_append_entries: 1,
+            },
+        };
+        assert_eq!(
+            serde_json::from_str::<Response>(&serde_json::to_string(&current).unwrap()).unwrap(),
+            current
+        );
+    }
+
+    #[test]
+    fn only_explicit_temporary_refusals_can_be_retried() {
+        for code in [error_code::LOCKED, error_code::UNAVAILABLE] {
+            assert!(error_code::is_retryable(code));
+        }
+        for code in [
+            error_code::UNAUTHORIZED,
+            error_code::TOO_LARGE,
+            error_code::INVALID,
+            error_code::INTERNAL,
+            error_code::UNSUPPORTED_PROTOCOL,
+            "future_code",
+        ] {
+            assert!(!error_code::is_retryable(code));
+        }
+    }
 
     #[test]
     fn messages_round_trip_as_tagged_json() {

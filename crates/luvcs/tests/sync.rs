@@ -421,3 +421,154 @@ fn a_blob_that_failed_to_download_is_fetched_by_the_next_pull() {
     // And once fetched it is not fetched again.
     assert_eq!(b.pull(&remote).blobs, 0);
 }
+
+/// A host with smaller transport budgets and an injectable atomic refusal.
+struct LimitedRemote {
+    inner: MemoryRemote,
+    limits: luvcs_protocol::RemoteLimits,
+    appends: Cell<usize>,
+    fail_at: Cell<usize>,
+    chunks: Cell<usize>,
+}
+
+impl LimitedRemote {
+    fn new() -> Self {
+        Self {
+            inner: MemoryRemote::new(),
+            limits: luvcs_protocol::RemoteLimits {
+                max_entry_bytes: 1024,
+                max_blob_chunk_bytes: 17,
+                max_append_entries: 1,
+            },
+            appends: Cell::new(0),
+            fail_at: Cell::new(0),
+            chunks: Cell::new(0),
+        }
+    }
+}
+
+impl Remote for LimitedRemote {
+    fn limits(&self) -> luvcs_protocol::RemoteLimits {
+        self.limits
+    }
+    fn head(&self) -> luvcs::remote::RemoteResult<u64> {
+        self.inner.head()
+    }
+    fn read(
+        &self,
+        after: u64,
+        limit: u32,
+    ) -> luvcs::remote::RemoteResult<Vec<luvcs_protocol::Entry>> {
+        self.inner.read(after, limit)
+    }
+    fn append(&self, entries: &[EntryBody]) -> luvcs::remote::RemoteResult<u64> {
+        luvcs::remote::check_append(entries, self.limits)?;
+        self.appends.set(self.appends.get() + 1);
+        if self.fail_at.get() == self.appends.get() {
+            return Err(luvcs::remote::RemoteError::Refused {
+                code: "unavailable".into(),
+                message: "try later".into(),
+            });
+        }
+        self.inner.append(entries)
+    }
+    fn put_blob_chunk(
+        &self,
+        repo: &str,
+        blob: &str,
+        index: u32,
+        bytes: &[u8],
+    ) -> luvcs::remote::RemoteResult<()> {
+        assert!(bytes.len() <= self.limits.max_blob_chunk_bytes as usize);
+        self.chunks.set(self.chunks.get() + 1);
+        self.inner.put_blob_chunk(repo, blob, index, bytes)
+    }
+    fn get_blob_chunk(
+        &self,
+        repo: &str,
+        blob: &str,
+        index: u32,
+    ) -> luvcs::remote::RemoteResult<Option<Vec<u8>>> {
+        self.inner.get_blob_chunk(repo, blob, index)
+    }
+}
+
+#[test]
+fn negotiated_limits_split_objects_appends_and_blobs_and_allow_resuming() {
+    let remote = LimitedRemote::new();
+    let a = Device::new(0);
+    let repo = a.create("small remote");
+    let object = a.save_text(&repo, None, &"x".repeat(600));
+    a.save_text(&repo, None, &"y".repeat(600));
+    let bytes = vec![42; 100];
+    let blob_id = match a.run(VcsRequest::PutBlob {
+        repo_id: repo.clone(),
+        data_base64: base64::engine::general_purpose::STANDARD.encode(&bytes),
+    }) {
+        VcsResponse::Blob { blob } => blob.blob_id,
+        other => panic!("{other:?}"),
+    };
+    let commit = a.record(&repo, "first");
+    remote.fail_at.set(3);
+    let error = push(&a.conn, &a.ctx(), &remote, "r", &repo).unwrap_err();
+    assert!(error.is_retryable());
+    assert_eq!(remote.head().unwrap(), 2);
+    let b = Device::new(100);
+    b.pull(&remote); // A partial push never announces an incomplete head.
+    assert!(b.heads(&repo).is_empty());
+    remote.fail_at.set(0);
+    a.push(&remote, &repo);
+    assert!(remote.chunks.get() >= 6);
+    b.pull(&remote);
+    assert_eq!(b.text_at(&repo, &object, &commit), "x".repeat(600));
+    match b.run(VcsRequest::ReadBlob {
+        repo_id: repo,
+        blob_id,
+        offset: None,
+        length: None,
+    }) {
+        VcsResponse::BlobBytes { data_base64, .. } => assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(data_base64)
+                .unwrap(),
+            bytes
+        ),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn oversized_object_is_refused_before_any_remote_write() {
+    let remote = LimitedRemote::new();
+    let a = Device::new(0);
+    let repo = a.create("large object");
+    a.save_text(
+        &repo,
+        None,
+        &"x".repeat(luvcs_protocol::MAX_ENTRY_BYTES + 1),
+    );
+    a.run(VcsRequest::PutBlob {
+        repo_id: repo.clone(),
+        data_base64: "eA==".into(),
+    });
+    let error = push(&a.conn, &a.ctx(), &remote, "r", &repo).unwrap_err();
+    assert!(!error.is_retryable());
+    assert!(
+        matches!(error, SyncError::Remote(luvcs::remote::RemoteError::Refused { ref code, .. }) if code == "too_large")
+    );
+    assert_eq!(remote.head().unwrap(), 0);
+    assert_eq!(remote.chunks.get(), 0);
+}
+
+#[test]
+fn zero_remote_limits_are_protocol_errors() {
+    let mut remote = LimitedRemote::new();
+    remote.limits.max_blob_chunk_bytes = 0;
+    let a = Device::new(0);
+    let repo = a.create("invalid remote");
+    assert!(matches!(
+        push(&a.conn, &a.ctx(), &remote, "r", &repo),
+        Err(SyncError::Remote(luvcs::remote::RemoteError::Protocol(_)))
+    ));
+    assert_eq!(remote.head().unwrap(), 0);
+}

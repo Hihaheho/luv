@@ -91,6 +91,26 @@ Undo / redo, integrate and conflict resolution exist in the request API but not 
 | `luvcs-macros` | Attribute macro that generates the FFI-facing types |
 | `luvcs-protocol` | The messages between luvcs and a remote: log entries, blob chunks, remote configuration |
 
+## Embedding and the remote contract
+
+Push follows the remote's advertised entry, blob chunk, and append limits.
+Remotes that omit limits use defaults of 1 MiB, 4 MiB, and 256 entries.
+A single object exceeding the entry limit is rejected with `too_large` before
+any remote write. Use `SaveBinary` / `PutBlob` for large binary content.
+
+`RemoteError::is_retryable()` and `SyncError::is_retryable()` identify
+`locked` and `unavailable` as retryable errors. The host controls the delay
+and retry count; other errors require user attention.
+
+Use `ListObjects` / `ReadObject` with a commit ID to read a snapshot,
+`Log` / `Show` for commit history, and `ReadBlob` for binary content.
+Object views include text, record JSON, and conflict terms.
+
+The default `bundled-sqlite` feature includes SQLite. Hosts can disable
+default features and select `store` and `rust-digest` as needed.
+`DirRemote` and `ProcessRemote` are native-only; `Remote`, `MemoryRemote`,
+and the protocol types are available on wasm.
+
 ## License
 
 Dual-licensed under MIT or Apache-2.0, at your option.

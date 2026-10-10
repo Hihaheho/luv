@@ -5,11 +5,11 @@
 //! three implementations:
 //!
 //! - [`MemoryRemote`]: in process, for tests and embedding.
-//! - [`DirRemote`]: a directory several devices can reach. Appends are
+//! - `DirRemote` (native only): a directory several devices can reach. Appends are
 //!   atomic and ordered without a lock: an entry file is written whole, then
 //!   published with a hard link whose name is its index, so two writers can
 //!   never both take the same index.
-//! - [`ProcessRemote`]: a child process that speaks the protocol as one JSON
+//! - `ProcessRemote` (native only): a child process that speaks the protocol as one JSON
 //!   document per line. This is how another program (a service, a different
 //!   storage) becomes a remote.
 //!
@@ -18,14 +18,13 @@
 //! documents the protocol by example.
 
 use std::collections::BTreeMap;
-use std::io::{BufRead, BufReader, Write};
-use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::io::{BufRead, Write};
 use std::sync::Mutex;
 
 use base64::Engine as _;
 use luvcs_protocol::{
-    Entry, EntryBody, MAX_BLOB_CHUNK_BYTES, MAX_READ_ENTRIES, PROTOCOL_VERSION, Request, Response,
+    Entry, EntryBody, MAX_READ_ENTRIES, PROTOCOL_VERSION, RemoteLimits, Request, Response,
+    error_code,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -44,15 +43,71 @@ impl From<std::io::Error> for RemoteError {
     }
 }
 
+impl RemoteError {
+    /// The host may retry the sync operation after a delay; no busy retry loop
+    /// is imposed on synchronous or browser hosts.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Refused { code, .. } if error_code::is_retryable(code))
+    }
+}
+
+pub fn validate_limits(limits: RemoteLimits) -> RemoteResult<()> {
+    if limits.max_entry_bytes == 0
+        || limits.max_blob_chunk_bytes == 0
+        || limits.max_append_entries == 0
+    {
+        return Err(RemoteError::Protocol(
+            "remote limits must be positive".into(),
+        ));
+    }
+    Ok(())
+}
+
+/// Validates an entire append before any of it is published.
+pub fn check_append(entries: &[EntryBody], limits: RemoteLimits) -> RemoteResult<()> {
+    validate_limits(limits)?;
+    let too_large = || RemoteError::Refused {
+        code: error_code::TOO_LARGE.into(),
+        message: "append exceeds advertised entry size or count".into(),
+    };
+    if entries.len() > limits.max_append_entries as usize {
+        return Err(too_large());
+    }
+    for entry in entries {
+        if let EntryBody::Objects { objects, .. } = entry {
+            let mut size = 0u64;
+            for object in objects {
+                let bytes = base64::engine::general_purpose::STANDARD
+                    .decode(&object.bytes_base64)
+                    .map_err(|e| RemoteError::Refused {
+                        code: error_code::INVALID.into(),
+                        message: e.to_string(),
+                    })?;
+                size += bytes.len() as u64;
+                if size > u64::from(limits.max_entry_bytes) {
+                    return Err(too_large());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub type RemoteResult<T> = Result<T, RemoteError>;
 
 /// The client side of a remote.
 pub trait Remote {
+    fn limits(&self) -> RemoteLimits {
+        RemoteLimits::default()
+    }
+
     /// Index of the last entry; 0 for an empty log.
     fn head(&self) -> RemoteResult<u64>;
     /// Entries with an index greater than `after`, at most `limit`, in order.
     fn read(&self, after: u64, limit: u32) -> RemoteResult<Vec<Entry>>;
     /// Appends `entries` atomically and in order; returns the new head.
+    /// Implementations must validate against `limits()` before writing (see
+    /// [`check_append`]). `serve` delegates validation to this method.
     fn append(&self, entries: &[EntryBody]) -> RemoteResult<u64>;
     fn put_blob_chunk(
         &self,
@@ -69,17 +124,23 @@ pub trait Remote {
     ) -> RemoteResult<Option<Vec<u8>>>;
 }
 
-fn check_chunk(bytes: &[u8]) -> RemoteResult<()> {
-    if bytes.len() > MAX_BLOB_CHUNK_BYTES {
+fn check_chunk(bytes: &[u8], limits: RemoteLimits) -> RemoteResult<()> {
+    validate_limits(limits)?;
+    if bytes.len() > limits.max_blob_chunk_bytes as usize {
         return Err(RemoteError::Refused {
             code: "too_large".into(),
-            message: format!("blob chunk of {} bytes", bytes.len()),
+            message: format!(
+                "blob chunk of {} bytes exceeds limit of {} bytes",
+                bytes.len(),
+                limits.max_blob_chunk_bytes
+            ),
         });
     }
     Ok(())
 }
 
 /// Ids are used as file names: letters, digits, `_` and `-` only.
+#[cfg(not(target_arch = "wasm32"))]
 fn check_name(what: &str, name: &str) -> RemoteResult<()> {
     let ok = !name.is_empty()
         && name.len() <= 128
@@ -140,6 +201,7 @@ impl Remote for MemoryRemote {
     }
 
     fn append(&self, entries: &[EntryBody]) -> RemoteResult<u64> {
+        check_append(entries, self.limits())?;
         let mut state = self.state.lock().unwrap();
         state.log.extend_from_slice(entries);
         Ok(state.log.len() as u64)
@@ -152,7 +214,7 @@ impl Remote for MemoryRemote {
         index: u32,
         bytes: &[u8],
     ) -> RemoteResult<()> {
-        check_chunk(bytes)?;
+        check_chunk(bytes, self.limits())?;
         self.state
             .lock()
             .unwrap()
@@ -177,388 +239,10 @@ impl Remote for MemoryRemote {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Directory
-// ---------------------------------------------------------------------------
-
-/// A remote in a directory:
-///
-/// ```text
-/// log/<first index, 20 digits>.json   a JSON array of entry bodies
-/// blobs/<repo id>/<blob id>/<chunk, 10 digits>
-/// ```
-///
-/// A log file holds the entries from its name's index up to the index before
-/// the next file's name, so a reader never opens a file it can skip.
-pub struct DirRemote {
-    root: PathBuf,
-}
-
-/// Retries of an append that lost the race for an index.
-const APPEND_ATTEMPTS: usize = 64;
-
-/// Creates `path` and its missing parents readable by the owner only. The
-/// log carries each repo's ID key, so it is as sensitive as the store. A
-/// directory that already exists keeps the mode its owner gave it.
-fn create_private_dir_all(path: &Path) -> std::io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::DirBuilderExt as _;
-        builder.mode(0o700);
-    }
-    builder.create(path)
-}
-
-/// Writes `bytes` to a new file readable by the owner only.
-fn write_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
-    use std::io::Write as _;
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt as _;
-        options.mode(0o600);
-    }
-    options.open(path)?.write_all(bytes)
-}
-
-impl DirRemote {
-    pub fn open(root: impl Into<PathBuf>) -> RemoteResult<Self> {
-        let root = root.into();
-        create_private_dir_all(&root.join("log"))?;
-        create_private_dir_all(&root.join("blobs"))?;
-        create_private_dir_all(&root.join("tmp"))?;
-        Ok(Self { root })
-    }
-
-    /// `(first index, path)` of every log file, ascending.
-    fn log_files(&self) -> RemoteResult<Vec<(u64, PathBuf)>> {
-        let mut files = Vec::new();
-        for entry in std::fs::read_dir(self.root.join("log"))? {
-            let entry = entry?;
-            let name = entry.file_name();
-            let Some(stem) = name.to_str().and_then(|n| n.strip_suffix(".json")) else {
-                continue;
-            };
-            let Ok(first) = stem.parse::<u64>() else {
-                continue;
-            };
-            files.push((first, entry.path()));
-        }
-        files.sort();
-        Ok(files)
-    }
-
-    fn read_file(path: &Path) -> RemoteResult<Vec<EntryBody>> {
-        let bytes = std::fs::read(path)?;
-        serde_json::from_slice(&bytes)
-            .map_err(|e| RemoteError::Protocol(format!("{}: {e}", path.display())))
-    }
-
-    fn blob_path(&self, repo_id: &str, blob_id: &str, index: u32) -> RemoteResult<PathBuf> {
-        check_name("repo id", repo_id)?;
-        check_name("blob id", blob_id)?;
-        Ok(self
-            .root
-            .join("blobs")
-            .join(repo_id)
-            .join(blob_id)
-            .join(format!("{index:010}")))
-    }
-
-    fn tmp_path(&self) -> PathBuf {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        self.root.join("tmp").join(format!(
-            "{}-{nanos}-{}",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ))
-    }
-}
-
-impl Remote for DirRemote {
-    fn head(&self) -> RemoteResult<u64> {
-        match self.log_files()?.last() {
-            None => Ok(0),
-            Some((first, path)) => Ok(first - 1 + Self::read_file(path)?.len() as u64),
-        }
-    }
-
-    fn read(&self, after: u64, limit: u32) -> RemoteResult<Vec<Entry>> {
-        let limit = limit.min(MAX_READ_ENTRIES) as usize;
-        let files = self.log_files()?;
-        let mut out = Vec::new();
-        for (i, (first, path)) in files.iter().enumerate() {
-            // Entries of this file end before the next file begins.
-            if let Some((next, _)) = files.get(i + 1)
-                && *next <= after + 1
-            {
-                continue;
-            }
-            for (offset, body) in Self::read_file(path)?.into_iter().enumerate() {
-                let index = first + offset as u64;
-                if index > after {
-                    out.push(Entry { index, body });
-                    if out.len() == limit {
-                        return Ok(out);
-                    }
-                }
-            }
-        }
-        Ok(out)
-    }
-
-    fn append(&self, entries: &[EntryBody]) -> RemoteResult<u64> {
-        if entries.is_empty() {
-            return self.head();
-        }
-        let tmp = self.tmp_path();
-        write_private(
-            &tmp,
-            &serde_json::to_vec(entries).map_err(|e| RemoteError::Protocol(e.to_string()))?,
-        )?;
-        let result = (|| {
-            for _ in 0..APPEND_ATTEMPTS {
-                let first = self.head()? + 1;
-                let target = self.root.join("log").join(format!("{first:020}.json"));
-                match std::fs::hard_link(&tmp, &target) {
-                    Ok(()) => return Ok(first - 1 + entries.len() as u64),
-                    // Another writer took this index: look again.
-                    Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
-                    Err(e) => return Err(RemoteError::from(e)),
-                }
-            }
-            Err(RemoteError::Io("log is too contended to append".into()))
-        })();
-        let _ = std::fs::remove_file(&tmp);
-        result
-    }
-
-    fn put_blob_chunk(
-        &self,
-        repo_id: &str,
-        blob_id: &str,
-        index: u32,
-        bytes: &[u8],
-    ) -> RemoteResult<()> {
-        check_chunk(bytes)?;
-        let path = self.blob_path(repo_id, blob_id, index)?;
-        create_private_dir_all(path.parent().expect("chunk has a parent"))?;
-        let tmp = self.tmp_path();
-        write_private(&tmp, bytes)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
-    }
-
-    fn get_blob_chunk(
-        &self,
-        repo_id: &str,
-        blob_id: &str,
-        index: u32,
-    ) -> RemoteResult<Option<Vec<u8>>> {
-        match std::fs::read(self.blob_path(repo_id, blob_id, index)?) {
-            Ok(bytes) => Ok(Some(bytes)),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Process
-// ---------------------------------------------------------------------------
-
-struct Pipe {
-    child: Child,
-    /// `None` once closed, which is how a server is told to exit.
-    stdin: Option<ChildStdin>,
-    stdout: BufReader<ChildStdout>,
-}
-
-/// A remote served by a child process, one JSON document per line in each
-/// direction. The command is split on whitespace (no quoting): wrap anything
-/// more complex in a script.
-///
-/// Dropping the remote closes the server's stdin and waits up to five
-/// seconds for it to exit, then kills it. A server should therefore exit when
-/// its input ends, as [`serve`] does.
-pub struct ProcessRemote {
-    pipe: Mutex<Pipe>,
-    backend: String,
-}
-
-impl ProcessRemote {
-    pub fn spawn(command: &str) -> RemoteResult<Self> {
-        let mut parts = command.split_whitespace();
-        let program = parts
-            .next()
-            .ok_or_else(|| RemoteError::Io("remote command is empty".into()))?;
-        let mut child = Command::new(program)
-            .args(parts)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .map_err(|e| RemoteError::Io(format!("cannot start {program:?}: {e}")))?;
-        let stdin = child.stdin.take().expect("stdin is piped");
-        let stdout = BufReader::new(child.stdout.take().expect("stdout is piped"));
-        let mut remote = Self {
-            pipe: Mutex::new(Pipe {
-                child,
-                stdin: Some(stdin),
-                stdout,
-            }),
-            backend: String::new(),
-        };
-        match remote.call(&Request::Hello {
-            protocol: PROTOCOL_VERSION,
-            client: format!("luvcs/{}", env!("CARGO_PKG_VERSION")),
-        })? {
-            Response::Welcome {
-                protocol, backend, ..
-            } if protocol == PROTOCOL_VERSION => {
-                remote.backend = backend;
-                Ok(remote)
-            }
-            Response::Welcome { protocol, .. } => Err(RemoteError::Protocol(format!(
-                "remote speaks protocol {protocol}, this client {PROTOCOL_VERSION}"
-            ))),
-            other => Err(RemoteError::Protocol(format!(
-                "expected a welcome, got {other:?}"
-            ))),
-        }
-    }
-
-    /// What the remote called itself in its welcome.
-    pub fn backend(&self) -> &str {
-        &self.backend
-    }
-
-    fn call(&self, request: &Request) -> RemoteResult<Response> {
-        let mut pipe = self.pipe.lock().unwrap();
-        let mut line =
-            serde_json::to_string(request).map_err(|e| RemoteError::Protocol(e.to_string()))?;
-        line.push('\n');
-        let stdin = pipe
-            .stdin
-            .as_mut()
-            .ok_or_else(|| RemoteError::Io("remote connection is closed".into()))?;
-        stdin.write_all(line.as_bytes())?;
-        stdin.flush()?;
-        let mut reply = String::new();
-        if pipe.stdout.read_line(&mut reply)? == 0 {
-            return Err(RemoteError::Io("remote closed the connection".into()));
-        }
-        match serde_json::from_str::<Response>(&reply)
-            .map_err(|e| RemoteError::Protocol(format!("bad reply: {e}")))?
-        {
-            Response::Error { code, message } => Err(RemoteError::Refused { code, message }),
-            other => Ok(other),
-        }
-    }
-}
-
-impl Drop for ProcessRemote {
-    fn drop(&mut self) {
-        if let Ok(pipe) = self.pipe.get_mut() {
-            // Closing stdin tells a well-behaved server to exit; a server
-            // that ignores it is not waited for forever.
-            drop(pipe.stdin.take());
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                match pipe.child.try_wait() {
-                    Ok(Some(_)) | Err(_) => break,
-                    Ok(None) if std::time::Instant::now() >= deadline => {
-                        let _ = pipe.child.kill();
-                        let _ = pipe.child.wait();
-                        break;
-                    }
-                    Ok(None) => std::thread::sleep(std::time::Duration::from_millis(10)),
-                }
-            }
-        }
-    }
-}
-
-fn unexpected(what: &str, got: Response) -> RemoteError {
-    RemoteError::Protocol(format!("expected {what}, got {got:?}"))
-}
-
-impl Remote for ProcessRemote {
-    fn head(&self) -> RemoteResult<u64> {
-        match self.call(&Request::Head)? {
-            Response::Head { head } => Ok(head),
-            other => Err(unexpected("a head", other)),
-        }
-    }
-
-    fn read(&self, after: u64, limit: u32) -> RemoteResult<Vec<Entry>> {
-        match self.call(&Request::Read { after, limit })? {
-            Response::Entries { entries, .. } => Ok(entries),
-            other => Err(unexpected("entries", other)),
-        }
-    }
-
-    fn append(&self, entries: &[EntryBody]) -> RemoteResult<u64> {
-        match self.call(&Request::Append {
-            entries: entries.to_vec(),
-        })? {
-            Response::Appended { head } => Ok(head),
-            other => Err(unexpected("an append receipt", other)),
-        }
-    }
-
-    fn put_blob_chunk(
-        &self,
-        repo_id: &str,
-        blob_id: &str,
-        index: u32,
-        bytes: &[u8],
-    ) -> RemoteResult<()> {
-        check_chunk(bytes)?;
-        match self.call(&Request::PutBlobChunk {
-            repo_id: repo_id.into(),
-            blob_id: blob_id.into(),
-            index,
-            data_base64: base64::engine::general_purpose::STANDARD.encode(bytes),
-        })? {
-            Response::Ok => Ok(()),
-            other => Err(unexpected("ok", other)),
-        }
-    }
-
-    fn get_blob_chunk(
-        &self,
-        repo_id: &str,
-        blob_id: &str,
-        index: u32,
-    ) -> RemoteResult<Option<Vec<u8>>> {
-        match self.call(&Request::GetBlobChunk {
-            repo_id: repo_id.into(),
-            blob_id: blob_id.into(),
-            index,
-        })? {
-            Response::BlobChunk { data_base64: None } => Ok(None),
-            Response::BlobChunk {
-                data_base64: Some(text),
-            } => {
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(text)
-                    .map_err(|e| RemoteError::Protocol(format!("blob chunk: {e}")))?;
-                check_chunk(&bytes)?;
-                Ok(Some(bytes))
-            }
-            other => Err(unexpected("a blob chunk", other)),
-        }
-    }
-}
+#[cfg(not(target_arch = "wasm32"))]
+mod native;
+#[cfg(not(target_arch = "wasm32"))]
+pub use native::{DirRemote, ProcessRemote};
 
 // ---------------------------------------------------------------------------
 // Serving
@@ -573,10 +257,12 @@ fn serve_one(remote: &dyn Remote, request: Request, backend: &str) -> RemoteResu
                     message: format!("this server speaks protocol {PROTOCOL_VERSION}"),
                 });
             }
+            validate_limits(remote.limits())?;
             Response::Welcome {
                 protocol: PROTOCOL_VERSION,
                 backend: backend.to_owned(),
                 head: remote.head()?,
+                limits: remote.limits(),
             }
         }
         Request::Head => Response::Head {
@@ -601,6 +287,7 @@ fn serve_one(remote: &dyn Remote, request: Request, backend: &str) -> RemoteResu
                     code: "invalid".into(),
                     message: format!("blob chunk: {e}"),
                 })?;
+            check_chunk(&bytes, remote.limits())?;
             remote.put_blob_chunk(&repo_id, &blob_id, index, &bytes)?;
             Response::Ok
         }
@@ -651,9 +338,10 @@ pub fn serve(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn heads(n: u32) -> EntryBody {
         EntryBody::Heads {
@@ -693,6 +381,7 @@ mod tests {
         assert_eq!(remote.append(&[heads(1), heads(2)]).unwrap(), 2);
         assert_eq!(remote.append(&[heads(3)]).unwrap(), 3);
         assert_eq!(remote.head().unwrap(), 3);
+        assert!(remote.read(0, 0).unwrap().is_empty());
 
         let all = remote.read(0, 10).unwrap();
         assert_eq!(
@@ -714,6 +403,70 @@ mod tests {
             remote.get_blob_chunk("repo_a", "blob_x", 0).unwrap(),
             Some(b"abc".to_vec())
         );
+    }
+
+    #[test]
+    fn serve_returns_append_validation_errors_without_writing() {
+        let remote = MemoryRemote::new();
+        for body in [
+            EntryBody::Objects {
+                repo_id: "repo_a".into(),
+                objects: vec![luvcs_protocol::WireObject {
+                    kind: "content".into(),
+                    logical_id_base64: "".into(),
+                    bytes_base64: "invalid!".into(),
+                }],
+            },
+            EntryBody::Objects {
+                repo_id: "repo_a".into(),
+                objects: vec![luvcs_protocol::WireObject {
+                    kind: "content".into(),
+                    logical_id_base64: "".into(),
+                    bytes_base64: base64::engine::general_purpose::STANDARD.encode(vec![
+                        0;
+                        luvcs_protocol::MAX_ENTRY_BYTES
+                            + 1
+                    ]),
+                }],
+            },
+        ] {
+            let input = serde_json::to_string(&Request::Append {
+                entries: vec![heads(0), body],
+            })
+            .unwrap();
+            let mut output = Vec::new();
+            serve(&remote, "memory", input.as_bytes(), &mut output).unwrap();
+            assert!(
+                matches!(serde_json::from_slice::<Response>(&output).unwrap(), Response::Error { code, .. } if code == error_code::INVALID || code == error_code::TOO_LARGE)
+            );
+            assert_eq!(remote.head().unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn append_checks_are_atomic_and_include_the_exact_boundary() {
+        let remote = MemoryRemote::new();
+        let object = |length| EntryBody::Objects {
+            repo_id: "repo_a".into(),
+            objects: vec![luvcs_protocol::WireObject {
+                kind: "content".into(),
+                logical_id_base64: "".into(),
+                bytes_base64: base64::engine::general_purpose::STANDARD.encode(vec![0; length]),
+            }],
+        };
+        let max = luvcs_protocol::MAX_ENTRY_BYTES;
+        assert!(remote.append(&[heads(0), object(max + 1)]).is_err());
+        assert_eq!(remote.head().unwrap(), 0);
+        assert!(
+            remote
+                .append(&vec![
+                    heads(0);
+                    luvcs_protocol::MAX_APPEND_ENTRIES as usize + 1
+                ])
+                .is_err()
+        );
+        assert_eq!(remote.head().unwrap(), 0);
+        assert_eq!(remote.append(&[object(max)]).unwrap(), 1);
     }
 
     #[test]
@@ -754,7 +507,7 @@ mod tests {
     #[test]
     fn oversized_chunks_are_refused() {
         let remote = MemoryRemote::new();
-        let big = vec![0u8; MAX_BLOB_CHUNK_BYTES + 1];
+        let big = vec![0u8; luvcs_protocol::MAX_BLOB_CHUNK_BYTES + 1];
         assert!(remote.put_blob_chunk("repo_a", "blob_x", 0, &big).is_err());
     }
 

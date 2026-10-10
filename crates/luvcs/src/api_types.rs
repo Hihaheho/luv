@@ -361,7 +361,8 @@ pub struct VcsConflictTermView {
     pub path: String,
     /// `value`, `order`, `deleted_vs_edited`, `text_region`.
     pub kind: String,
-    /// One candidate per side; `None` when that side deleted it.
+    /// One candidate per side: text for text states, JSON for record states.
+    /// `None` when that side has no content (including deletion).
     pub candidates: Vec<Option<String>>,
 }
 
@@ -374,7 +375,11 @@ pub struct VcsConflictView {
     /// Everything that did merge, as provisional full text (text driver).
     #[cfg_attr(feature = "ts", ts(optional = nullable))]
     pub merged_text: Option<String>,
-    /// Full text of each side, for whole-side resolution.
+    /// Provisional record including non-conflicting fields, in record JSON form.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub merged_record_json: Option<String>,
+    /// Full text or record JSON of each side, for whole-side resolution.
     pub sides: Vec<Option<String>>,
     pub terms: Vec<VcsConflictTermView>,
 }

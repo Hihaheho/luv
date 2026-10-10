@@ -668,3 +668,168 @@ fn binary_objects_carry_local_blobs_through_export_and_import() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn record_conflict_and_historical_snapshots_are_readable() {
+    let conn = Connection::open_in_memory().unwrap();
+    let host = host();
+    let repo = create(&conn, &host);
+    let save = |text: &str, id: Option<String>| match run(
+        &conn,
+        &host,
+        VcsRequest::SaveRecord {
+            repo_id: repo.clone(),
+            object_id: id,
+            type_id: "note".into(),
+            schema_id: "card.v1".into(),
+            record_json: serde_json::json!({"title": text, "count": 7}).to_string(),
+            title: None,
+        },
+    ) {
+        VcsResponse::Object { object } => object.object_id,
+        other => panic!("{other:?}"),
+    };
+    let record = |d: &str| match run(
+        &conn,
+        &host,
+        VcsRequest::Record {
+            repo_id: repo.clone(),
+            description: d.into(),
+            objects: None,
+        },
+    ) {
+        VcsResponse::Commit { commit } => commit.commit_id,
+        other => panic!("{other:?}"),
+    };
+    let id = save("A\nB\nC\n", None);
+    let base = record("base");
+    save("A\nB-left\nC\n", Some(id.clone()));
+    let left = record("left");
+    // The other side: a second workspace at `base`, driven through the store
+    // directly (another device would produce this through sync).
+    let right = {
+        use luvcs::id::{IdKey, ObjectId, OperationId, RepoId, WorkspaceId};
+        use luvcs::model::Actor;
+        use luvcs::store::{OperationContext, RecordSource, Store};
+        let (repo_bytes, key): (Vec<u8>, Vec<u8>) = conn
+            .query_row("SELECT repo_id, id_key FROM vcs_local_repos", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        let mut store = Store::open(&conn, RustDigest)
+            .unwrap()
+            .with_schemas(host.ctx().schemas);
+        let mut r = store
+            .repo(
+                RepoId::from_bytes(&repo_bytes).unwrap(),
+                IdKey(key.try_into().unwrap()),
+            )
+            .unwrap();
+        let ws2 = WorkspaceId([0xEE; 16]);
+        r.create_workspace(ws2, Some(base.parse().unwrap()))
+            .unwrap();
+        let oid: ObjectId = id.parse().unwrap();
+        let st = r
+            .put_record_state(
+                oid,
+                "note",
+                "card.v1",
+                &record_from_json(r#"{"title":"A\nB-right\nC\n", "count":7}"#).unwrap(),
+                luvcs::cbor::Value::Map(vec![]),
+            )
+            .unwrap();
+        let ctx = |n: u8| OperationContext {
+            operation_id: OperationId([0xD0 + n; 16]),
+            workspace_id: ws2,
+            expected_token: None,
+            actor: Actor {
+                kind: ActorKind::User,
+                device_id: "dev-b".into(),
+                description: String::new(),
+            },
+            reason: String::new(),
+            now_unix_ms: 5,
+        };
+        r.save_working(&ctx(1), &[(oid, Some(st))]).unwrap();
+        r.record(&ctx(2), RecordSource::Working, "right")
+            .unwrap()
+            .to_string()
+    };
+    assert_ne!(left, right);
+    let merge = match run(
+        &conn,
+        &host,
+        VcsRequest::Integrate {
+            repo_id: repo.clone(),
+            commit_id: right,
+        },
+    ) {
+        VcsResponse::Integrated { commit_id, .. } => commit_id,
+        other => panic!("{other:?}"),
+    };
+    let historical = match run(
+        &conn,
+        &host,
+        VcsRequest::ReadObject {
+            repo_id: repo.clone(),
+            object_id: id.clone(),
+            commit_id: Some(base.clone()),
+        },
+    ) {
+        VcsResponse::Object { object } => object,
+        other => panic!("{other:?}"),
+    };
+    let record: serde_json::Value =
+        serde_json::from_str(historical.record_json.as_deref().unwrap()).unwrap();
+    assert_eq!(record["count"], 7);
+    assert_eq!(record["title"], "A\nB\nC\n");
+    let objects = match run(
+        &conn,
+        &host,
+        VcsRequest::ListObjects {
+            repo_id: repo.clone(),
+            commit_id: Some(merge.clone()),
+        },
+    ) {
+        VcsResponse::Objects { objects } => objects,
+        other => panic!("{other:?}"),
+    };
+    let conflict = objects[0].conflict.as_ref().unwrap();
+    assert_eq!(conflict.driver, "merge.record.v1");
+    assert!(conflict.merged_text.is_none());
+    let merged: serde_json::Value =
+        serde_json::from_str(conflict.merged_record_json.as_deref().unwrap()).unwrap();
+    assert_eq!(merged["count"], 7);
+    for side in &conflict.sides {
+        let record: serde_json::Value = serde_json::from_str(side.as_deref().unwrap()).unwrap();
+        assert_eq!(record["count"], 7);
+    }
+    assert!(!conflict.terms.is_empty());
+    let candidates: Vec<serde_json::Value> = conflict.terms[0]
+        .candidates
+        .iter()
+        .map(|c| serde_json::from_str(c.as_deref().unwrap()).unwrap())
+        .collect();
+    assert_eq!(
+        candidates,
+        vec![
+            serde_json::json!("B-left\n"),
+            serde_json::json!("B-right\n")
+        ]
+    );
+    match run(
+        &conn,
+        &host,
+        VcsRequest::Log {
+            repo_id: repo.clone(),
+            from_commit_id: Some(merge.clone()),
+            limit: 10,
+        },
+    ) {
+        VcsResponse::Commits { commits } => {
+            assert!(commits.iter().any(|c| c.commit_id == base));
+            assert!(commits.iter().any(|c| c.commit_id == merge));
+        }
+        other => panic!("{other:?}"),
+    }
+}

@@ -91,6 +91,26 @@ undo / redo、統合、衝突の解消はリクエスト API にはあります�
 | `luvcs-macros` | FFI 向け型を生成する属性マクロ |
 | `luvcs-protocol` | luvcs とリモートの間のメッセージ。ログのエントリ、blob のチャンク、リモートの設定 |
 
+## 組み込みと remote の契約
+
+push は remote が通知するエントリ、blob チャンク、Append 件数の上限に従います。
+上限を省略した remote には、既定値の 1 MiB、4 MiB、256 件を使います。
+単独の object がエントリ上限を超える場合、remote に書き込む前に `too_large` で拒否します。
+大きいバイナリには `SaveBinary` / `PutBlob` を使えます。
+
+`RemoteError::is_retryable()` と `SyncError::is_retryable()` で、
+`locked` / `unavailable` を再試行可能なエラーとして判別できます。
+待ち時間と再試行回数はホストが決め、他のエラーは利用者に伝えます。
+
+コミット ID を指定した `ListObjects` / `ReadObject` でスナップショットを、
+`Log` / `Show` でコミット履歴を、`ReadBlob` でバイナリを読めます。
+object の応答には text、record JSON、conflict の項を含みます。
+
+デフォルトの feature `bundled-sqlite` は SQLite を同梱します。
+組み込む側は default features を無効にし、必要に応じて `store` / `rust-digest` を選べます。
+`DirRemote` / `ProcessRemote` は native 専用です。
+wasm では `Remote` / `MemoryRemote` とプロトコルの型を利用できます。
+
 ## ライセンス
 
 MIT または Apache-2.0 のどちらかを選べます。

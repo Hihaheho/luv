@@ -19,9 +19,7 @@
 //! cursor and what it is known to hold); use a stable string per remote.
 
 use base64::Engine as _;
-use luvcs_protocol::{
-    EntryBody, MAX_BLOB_CHUNK_BYTES, MAX_ENTRY_BYTES, MAX_READ_ENTRIES, WireObject, WireRef,
-};
+use luvcs_protocol::{EntryBody, MAX_READ_ENTRIES, WireObject, WireRef};
 use rusqlite::{Connection, OptionalExtension as _, params};
 
 use crate::api::{HostContext, LocalRepo, VcsError, ensure_local_schema, insert_local_repo};
@@ -51,6 +49,12 @@ pub enum SyncError {
 impl From<VcsError> for SyncError {
     fn from(e: VcsError) -> Self {
         SyncError::Api(e)
+    }
+}
+
+impl SyncError {
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, Self::Remote(error) if error.is_retryable())
     }
 }
 
@@ -156,6 +160,7 @@ pub fn push(
     remote_name: &str,
     repo_id: &str,
 ) -> Result<PushReport> {
+    crate::remote::validate_limits(remote.limits())?;
     ensure_schema(conn)?;
     blob_store::ensure_schema(conn)?;
     let local = crate::api::local_repo(conn, repo_id)?;
@@ -164,6 +169,7 @@ pub fn push(
     let mut store = Store::open(conn, host.digest)?;
     let repo = store.repo(rid, local.key.clone())?;
 
+    let limits = remote.limits();
     let mut bodies: Vec<EntryBody> = Vec::new();
     let mut report = PushReport::default();
 
@@ -204,7 +210,20 @@ pub fn push(
         let mut group_bytes = 0usize;
         for row in rows {
             let (kind, logical_id, bytes) = row?;
-            if group_bytes + bytes.len() > MAX_ENTRY_BYTES && !group.is_empty() {
+            if bytes.len() > limits.max_entry_bytes as usize {
+                return Err(RemoteError::Refused {
+                    code: luvcs_protocol::error_code::TOO_LARGE.into(),
+                    message: format!(
+                        "object {kind}:{} is {} bytes; remote entry limit is {} bytes \
+                         (objects cannot span entries)",
+                        hex::encode(&logical_id),
+                        bytes.len(),
+                        limits.max_entry_bytes,
+                    ),
+                }
+                .into());
+            }
+            if bytes.len() > limits.max_entry_bytes as usize - group_bytes && !group.is_empty() {
                 bodies.push(EntryBody::Objects {
                     repo_id: rid_text.clone(),
                     objects: std::mem::take(&mut group),
@@ -243,25 +262,21 @@ pub fn push(
             continue;
         }
         let length = info.blob_ref.byte_length;
-        let chunk = SEGMENT_SIZE.min(MAX_BLOB_CHUNK_BYTES as u64);
-        let count = length.div_ceil(chunk);
+        let chunk = SEGMENT_SIZE.min(u64::from(limits.max_blob_chunk_bytes));
+        let count = u32::try_from(length.div_ceil(chunk))
+            .map_err(|_| log_err("blob", "too many chunks for the remote limit"))?;
         for index in 0..count {
-            let offset = index * chunk;
+            let offset = u64::from(index) * chunk;
             let bytes =
                 blob_store::read_range(conn, realm_id, id, offset, chunk.min(length - offset))?;
-            remote.put_blob_chunk(
-                &rid_text,
-                &id.to_string(),
-                u32::try_from(index).map_err(|_| log_err("blob", "too many chunks"))?,
-                &bytes,
-            )?;
+            remote.put_blob_chunk(&rid_text, &id.to_string(), index, &bytes)?;
         }
         bodies.push(EntryBody::Blob {
             repo_id: rid_text.clone(),
             blob_id: id.to_string(),
             byte_length: length,
             raw_digest_hex: hex::encode(info.raw_digest),
-            chunk_count: count as u32,
+            chunk_count: count,
         });
         uploaded.push(id);
     }
@@ -297,7 +312,11 @@ pub fn push(
     report.head = if bodies.is_empty() {
         remote.head()?
     } else {
-        remote.append(&bodies)?
+        let mut head = 0;
+        for batch in bodies.chunks(limits.max_append_entries as usize) {
+            head = remote.append(batch)?;
+        }
+        head
     };
 
     // Only now does the device record what the remote holds.
