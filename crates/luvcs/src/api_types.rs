@@ -86,6 +86,16 @@ pub enum VcsRequest {
         repo_id: String,
         object_id: String,
     },
+    /// Saves the object as it is in the working tree under a new title (no
+    /// title when omitted), keeping its body and its other metadata: a
+    /// rename or a move, with no need to send the content again.
+    SetTitle {
+        repo_id: String,
+        object_id: String,
+        #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
+        title: Option<String>,
+    },
     /// Reads one object from the working tree, or from `commit_id`.
     ReadObject {
         repo_id: String,

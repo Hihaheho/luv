@@ -1009,6 +1009,53 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                 self.repo.save_working(&ctx, &[(id, None)])?;
                 VcsResponse::Ok
             }
+            VcsRequest::SetTitle {
+                object_id, title, ..
+            } => {
+                let id: ObjectId = parse("object id", &object_id)?;
+                let ws = self.workspace()?;
+                let working = self.repo.tree_entries(ws.working)?;
+                let current = working.get(&id).copied().ok_or_else(|| {
+                    VcsError::new(
+                        VcsErrorCode::NotFound,
+                        format!("object {id} is not in the working tree"),
+                    )
+                })?;
+                let mut state = self.repo.get_state(current)?;
+                match state.body {
+                    ObjectBody::Deleted => {
+                        return Err(VcsError::new(
+                            VcsErrorCode::NotFound,
+                            format!("object {id} is deleted"),
+                        ));
+                    }
+                    // Its title belongs to the conflict until it is resolved.
+                    ObjectBody::Conflict { .. } => {
+                        return Err(VcsError::new(
+                            VcsErrorCode::Conflict,
+                            format!("object {id} is in conflict; resolve it first"),
+                        ));
+                    }
+                    _ => {}
+                }
+                let mut entries: Vec<(Value, Value)> = state
+                    .metadata
+                    .map_entries()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|(k, _)| *k != "title")
+                    .map(|(k, v)| (Value::text(k), v.clone()))
+                    .collect();
+                if let Some(t) = title {
+                    entries.push((Value::text("title"), Value::text(t)));
+                }
+                state.metadata = Value::Map(entries);
+                let state_id = self.repo.put_state(&state)?;
+                let id = self.save(Some(&object_id), state_id)?;
+                VcsResponse::Object {
+                    object: self.object_view(id, state_id)?,
+                }
+            }
             VcsRequest::ReadObject {
                 object_id,
                 commit_id,
@@ -1366,6 +1413,7 @@ fn repo_id_of(request: &VcsRequest) -> Option<&str> {
         | VcsRequest::ReadBlob { repo_id, .. }
         | VcsRequest::ListBlobs { repo_id }
         | VcsRequest::DeleteObject { repo_id, .. }
+        | VcsRequest::SetTitle { repo_id, .. }
         | VcsRequest::ReadObject { repo_id, .. }
         | VcsRequest::ListObjects { repo_id, .. }
         | VcsRequest::Record { repo_id, .. }

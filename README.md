@@ -18,7 +18,7 @@ An object is one of these:
 - conflict: a merge result that has not been resolved.
 - deleted: the state that says an object was removed.
 
-An object has a random ID that is independent of any path. A path is just one piece of metadata, the `title`, and is not used for identity. The core is built on this. The CLI, however, currently maps a file to an object by using its path as the `title`, so it does not track a file that is moved.
+An object has a random ID that is independent of any path. A path is just one piece of metadata, the `title`, and is not used for identity. The core is built on this. The CLI maps a file to an object by using its path as the `title`. A file moved with `luv mv` stays the same object; a file moved or renamed any other way is seen as one file removed and another added.
 
 ### Merges look at the shape of the data
 
@@ -70,6 +70,7 @@ luv init --include "**/*.md"
 luv status
 luv diff
 luv commit -m "message"
+luv mv <from> <to>
 luv log [--from <rev>]
 luv restore [--commit cmt_...] [paths...]
 luv merge cmt_...
@@ -99,6 +100,8 @@ include = ["**/*.md"]
 `remote set` writes `.luv/remote.eure`, next to the store. `Luv.eure`, the file that is meant to travel with the files, never names a command, and `.luv`, `.git` and `.jj` are never tracked or restored at any depth, so files that come from someone else's history cannot change the remote or make `luv` run a command. `push` sends what the remote has not seen and never conflicts. `pull` takes the remote's history in and leaves your files alone. A remote is trusted like a secret: the first time a repo arrives from a remote, luv accepts the ID key that remote gives it, so pull only from remotes you trust. A second device starts with `remote set`, `pull`, then `init --repo <name>`, which attaches to the repo that was pulled, and `restore`.
 
 After concurrent commits a repo has several heads, and `luv log` shows them all. `merge` merges one of them into your last commit and writes the merged files. A file in conflict is written with `<<<<<<< left` / `>>>>>>> right` markers around each conflicting region (the conflict itself is still stored as a `Conflict` object, not as markers); `status` lists it as `C`, and `commit` refuses until `resolve` settles it, by default with the file as you edited it on disk, or with one side whole (`--take`). A conflict that is no file in the work tree (outside the allowlist, say) is listed by its `obj_…` ID and settled with `--take`. `undo` and `redo` step through the operation log (a commit, a merge, a resolve, a save) and write the files back. `merge`, `undo` and `redo` refuse while files on disk differ from what is saved, so they never overwrite your edits.
+
+`mv` moves a tracked file on disk and saves it under its new path as the same object, so a merge carries edits made under the old path over to the new one; two devices that move one file to different paths get a title conflict, settled with `resolve --title`. It also records a file you already moved by hand. `status` lists a move as `R <from> -> <to>` until `commit` records it; `commit <path>` with either path records it alone. `mv` moves single files, not directories.
 
 Wherever a command takes a commit (`<rev>`, `restore --commit`, `merge`, `log --from`), a bookmark name or a `bmk_…` ID works too. `luv commit` moves the selected bookmark forward; `luv log` shows the bookmarks on each commit. A name two bookmarks share, or a bookmark whose target is in conflict, is refused rather than guessed: use the `bmk_…` ID, and settle it with `rename`, `fuse` or `resolve`. Symbolic links are not tracked; luv prints a warning and skips them.
 

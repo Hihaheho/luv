@@ -107,6 +107,15 @@ pub enum LuvCommands {
         /// Only these paths; the rest stays uncommitted
         paths: Vec<String>,
     },
+    /// Move or rename a tracked file. It stays the same object, so a merge
+    /// takes edits made to it under its old path; the next commit records
+    /// the move. A file already moved on disk is only recorded
+    Mv {
+        /// The tracked file
+        from: String,
+        /// Its new path, or a directory to move it into
+        to: String,
+    },
     /// List commits, newest first, with the bookmarks on them
     Log {
         /// Maximum number of commits
@@ -229,6 +238,7 @@ fn run(cwd: &Path, args: LuvArgs) -> anyhow::Result<()> {
         LuvCommands::Status => ctx.status(),
         LuvCommands::Diff { paths } => ctx.diff(&paths),
         LuvCommands::Commit { message, paths } => ctx.commit(&message, &paths),
+        LuvCommands::Mv { from, to } => ctx.mv(&from, &to),
         LuvCommands::Log { limit, from } => ctx.log(limit, from),
         LuvCommands::Restore { commit, paths } => ctx.restore(commit, &paths),
         LuvCommands::Merge { commit } => ctx.merge(&commit),
@@ -408,6 +418,13 @@ impl WorkTree {
     /// content (possibly fetched from someone else), so it must stay inside
     /// the root: no absolute path, no `..`, and no symlinked directory on the way.
     fn write(&self, rel: &str, bytes: &[u8]) -> anyhow::Result<()> {
+        std::fs::write(self.prepare(rel)?, bytes)?;
+        Ok(())
+    }
+
+    /// The path to write `rel` at, after the checks `write` makes, with its
+    /// parent directories created.
+    fn prepare(&self, rel: &str) -> anyhow::Result<PathBuf> {
         if !is_safe_rel(rel) {
             anyhow::bail!("{rel:?} is not a safe relative path; refusing to write it");
         }
@@ -431,8 +448,7 @@ impl WorkTree {
                 Err(e) => return Err(e.into()),
             }
         }
-        std::fs::write(&path, bytes)?;
-        Ok(())
+        Ok(path)
     }
 }
 
@@ -460,6 +476,13 @@ struct Change {
     object: Option<VcsObjectView>,
     /// Bytes on disk (None for a removed file).
     disk: Option<Vec<u8>>,
+}
+
+/// A saved object under another path than in the last commit.
+struct Rename {
+    object_id: String,
+    from: String,
+    to: String,
 }
 
 struct Ctx<'a> {
@@ -624,8 +647,13 @@ impl Ctx<'_> {
         // leaves; the next `luv commit` records it.
         let pending: Vec<_> = status.changes.iter().filter(|c| !c.conflicted).collect();
         if !pending.is_empty() {
+            let renames = self.renames(&status)?;
             println!("saved, not committed yet:");
             for change in &pending {
+                if let Some(rename) = renames.iter().find(|r| r.object_id == change.object_id) {
+                    println!("  R {} -> {}", rename.from, rename.to);
+                    continue;
+                }
                 let letter = match change.kind.as_str() {
                     "added" => 'A',
                     "removed" => 'D',
@@ -645,6 +673,115 @@ impl Ctx<'_> {
         if changes.is_empty() && pending.is_empty() && paths.is_empty() {
             println!("nothing to commit");
         }
+        Ok(())
+    }
+
+    /// The saved objects whose title is not the one they have in the last
+    /// commit: the moves the next commit records.
+    fn renames(&self, status: &luvcs::api::VcsStatus) -> anyhow::Result<Vec<Rename>> {
+        let Some(base) = &status.base_commit_id else {
+            return Ok(Vec::new());
+        };
+        let changed: BTreeMap<&str, &str> = status
+            .changes
+            .iter()
+            .filter(|c| c.kind == "changed" && !c.conflicted)
+            .filter_map(|c| Some((c.object_id.as_str(), c.title.as_deref()?)))
+            .collect();
+        if changed.is_empty() {
+            return Ok(Vec::new());
+        }
+        let VcsResponse::Objects { objects } = self.call(VcsRequest::ListObjects {
+            repo_id: self.repo_id.clone(),
+            commit_id: Some(base.clone()),
+        })?
+        else {
+            anyhow::bail!("unexpected response to list");
+        };
+        let mut renames = Vec::new();
+        for object in objects {
+            let (Some(from), Some(to)) = (object.title, changed.get(object.object_id.as_str()))
+            else {
+                continue;
+            };
+            if from != *to {
+                renames.push(Rename {
+                    object_id: object.object_id,
+                    from,
+                    to: (*to).to_owned(),
+                });
+            }
+        }
+        renames.sort_by(|a, b| a.to.cmp(&b.to));
+        Ok(renames)
+    }
+
+    fn mv(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        let from = normalize(from);
+        let mut to = normalize(to);
+        // Into a directory, under the same name.
+        if to.ends_with('/') || self.tree.root.join(&to).is_dir() {
+            let name = from.rsplit('/').next().unwrap_or(&from);
+            to = format!("{}/{name}", to.trim_end_matches('/'));
+        }
+        if !self.tree.allows(&to) {
+            anyhow::bail!("{to} is not allowlisted in {CONFIG_FILE}");
+        }
+        let saved = self.saved()?;
+        let object = saved
+            .get(&from)
+            .ok_or_else(|| anyhow::anyhow!("{from} is not tracked; commit it first"))?;
+        if object.body_kind == "conflict" {
+            anyhow::bail!("{from} is in conflict; resolve it first");
+        }
+        if from == to {
+            anyhow::bail!("{from} is already there");
+        }
+        let folded = to.to_lowercase();
+        if let Some(taken) = saved
+            .keys()
+            .find(|p| **p != from && p.to_lowercase() == folded)
+        {
+            anyhow::bail!("{taken} is tracked already");
+        }
+        let is_file = |rel: &str| {
+            std::fs::symlink_metadata(self.tree.root.join(rel)).is_ok_and(|m| m.is_file())
+        };
+        // A rename that changes only case finds the file itself at `to` on
+        // a case-insensitive file system.
+        let to_taken = from.to_lowercase() != folded
+            && std::fs::symlink_metadata(self.tree.root.join(&to)).is_ok();
+        let move_file = match (is_file(&from), to_taken) {
+            (true, false) => true,
+            (false, true) if is_file(&to) => false,
+            (true, true) => anyhow::bail!("{to} exists already"),
+            (false, _) => {
+                anyhow::bail!("{from} is not on disk; `luv restore {from}` writes it back")
+            }
+        };
+        if move_file {
+            std::fs::rename(self.tree.root.join(&from), self.tree.prepare(&to)?)?;
+        }
+        let saved = self.call(VcsRequest::SetTitle {
+            repo_id: self.repo_id.clone(),
+            object_id: object.object_id.clone(),
+            title: Some(to.clone()),
+        });
+        if let Err(e) = saved {
+            if move_file
+                && let Err(back) =
+                    std::fs::rename(self.tree.root.join(&to), self.tree.root.join(&from))
+            {
+                // The file is at `to` but saved at `from`: a second `luv mv`
+                // finds it moved by hand and records the move.
+                anyhow::bail!(
+                    "{e}; and moving {to} back to {from} failed ({back}). \
+                     Run `luv mv {from} {to}` again to record the move"
+                );
+            }
+            return Err(e);
+        }
+        println!("R {from} -> {to}");
         Ok(())
     }
 
@@ -884,6 +1021,24 @@ impl Ctx<'_> {
             };
             selected.push(object_id);
         }
+        // Moves `luv mv` saved; with paths, those to or from one of them.
+        let VcsResponse::Status { status } = self.call(VcsRequest::Status {
+            repo_id: self.repo_id.clone(),
+        })?
+        else {
+            anyhow::bail!("unexpected response to status");
+        };
+        let only: BTreeSet<String> = paths.iter().map(|p| normalize(p)).collect();
+        let renames: Vec<Rename> = self
+            .renames(&status)?
+            .into_iter()
+            .filter(|r| only.is_empty() || only.contains(&r.from) || only.contains(&r.to))
+            .collect();
+        for rename in &renames {
+            if !selected.contains(&rename.object_id) {
+                selected.push(rename.object_id.clone());
+            }
+        }
         // With paths, record only those objects; without, the whole working
         // tree (which includes anything saved outside the allowlist).
         let objects = (!paths.is_empty()).then_some(selected);
@@ -910,6 +1065,9 @@ impl Ctx<'_> {
             },
         };
         println!("[{}] {message}", commit.commit_id);
+        for rename in &renames {
+            println!("R {} -> {}", rename.from, rename.to);
+        }
         for change in &changes {
             println!("{} {}", change.kind.letter(), change.path);
         }
@@ -1381,6 +1539,134 @@ mod tests {
         luv(root, &["redo"]).unwrap();
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "two\n");
         assert_eq!(base(root), two);
+    }
+
+    fn ctx_check<T>(dir: &Path, f: impl FnOnce(&Ctx<'_>) -> T) -> T {
+        let tree = WorkTree::discover(dir).unwrap();
+        let device = Local::open(dir).unwrap();
+        let ctx = Ctx {
+            device: &device,
+            tree: &tree,
+            repo_id: device.resolve_repo("notes").unwrap(),
+        };
+        f(&ctx)
+    }
+
+    fn object_ids(dir: &Path) -> BTreeMap<String, String> {
+        ctx_check(dir, |ctx| {
+            ctx.saved()
+                .unwrap()
+                .into_iter()
+                .map(|(path, o)| (path, o.object_id))
+                .collect()
+        })
+    }
+
+    #[test]
+    fn mv_moves_the_file_and_keeps_the_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        luv(root, &["init", "--repo", "notes", "--include", "**/*.md"]).unwrap();
+        std::fs::write(root.join("n.md"), "one\n").unwrap();
+        luv(root, &["commit", "-m", "one"]).unwrap();
+        let id = object_ids(root)["n.md"].clone();
+
+        luv(root, &["mv", "n.md", "notes/m.md"]).unwrap();
+        assert!(!root.join("n.md").exists());
+        assert_eq!(
+            std::fs::read_to_string(root.join("notes/m.md")).unwrap(),
+            "one\n"
+        );
+        let renames = ctx_check(root, |ctx| {
+            let VcsResponse::Status { status } = ctx
+                .call(VcsRequest::Status {
+                    repo_id: ctx.repo_id.clone(),
+                })
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert!(ctx.changes(&[]).unwrap().is_empty(), "nothing left on disk");
+            ctx.renames(&status).unwrap()
+        });
+        assert_eq!(renames.len(), 1);
+        assert_eq!(
+            (renames[0].from.as_str(), renames[0].to.as_str()),
+            ("n.md", "notes/m.md")
+        );
+        luv(root, &["commit", "-m", "move", "n.md"]).unwrap();
+        assert_eq!(object_ids(root)["notes/m.md"], id);
+
+        // Into a directory; then undo writes it back where it was.
+        std::fs::create_dir(root.join("old")).unwrap();
+        luv(root, &["mv", "notes/m.md", "old"]).unwrap();
+        assert!(root.join("old/m.md").is_file());
+        luv(root, &["undo"]).unwrap();
+        assert!(root.join("notes/m.md").is_file());
+        assert!(!root.join("old/m.md").exists());
+
+        // A file moved by hand is only recorded, edits and all.
+        std::fs::rename(root.join("notes/m.md"), root.join("x.md")).unwrap();
+        std::fs::write(root.join("x.md"), "two\n").unwrap();
+        luv(root, &["mv", "notes/m.md", "x.md"]).unwrap();
+        luv(root, &["commit", "-m", "moved by hand"]).unwrap();
+        assert_eq!(object_ids(root), BTreeMap::from([("x.md".into(), id)]));
+        assert_eq!(std::fs::read_to_string(root.join("x.md")).unwrap(), "two\n");
+    }
+
+    #[test]
+    fn mv_refuses_what_it_cannot_move() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        luv(root, &["init", "--repo", "notes", "--include", "*.md"]).unwrap();
+        std::fs::write(root.join("a.md"), "a\n").unwrap();
+        std::fs::write(root.join("b.md"), "b\n").unwrap();
+        luv(root, &["commit", "-m", "ab"]).unwrap();
+        std::fs::write(root.join("new.md"), "new\n").unwrap();
+        for (from, to) in [
+            ("new.md", "c.md"),   // not tracked
+            ("a.md", "b.md"),     // tracked already
+            ("a.md", "B.md"),     // tracked already, but for case
+            ("a.md", "new.md"),   // on disk already
+            ("a.md", "sub/a.md"), // not allowlisted
+            ("a.md", "a.md"),
+        ] {
+            assert!(luv(root, &["mv", from, to]).is_err(), "{from} -> {to}");
+        }
+        assert_eq!(std::fs::read_to_string(root.join("a.md")).unwrap(), "a\n");
+        luv(root, &["mv", "a.md", "A.md"]).unwrap();
+        assert!(object_ids(root).contains_key("A.md"));
+    }
+
+    #[test]
+    fn a_move_and_an_edit_of_the_same_file_merge() {
+        let (_remote, a, b) = two_devices();
+        luv(a.path(), &["mv", "n.md", "m.md"]).unwrap();
+        luv(a.path(), &["commit", "-m", "move"]).unwrap();
+        luv(a.path(), &["push"]).unwrap();
+        std::fs::write(b.path().join("n.md"), "1\n2\n3b\n").unwrap();
+        luv(b.path(), &["commit", "-m", "edit"]).unwrap();
+        luv(b.path(), &["push"]).unwrap();
+        luv(a.path(), &["pull"]).unwrap();
+        luv(b.path(), &["pull"]).unwrap();
+
+        let theirs = heads(a.path())
+            .into_iter()
+            .find(|h| *h != base(a.path()))
+            .unwrap();
+        luv(a.path(), &["merge", &theirs]).unwrap();
+        let ours = heads(b.path())
+            .into_iter()
+            .find(|h| *h != base(b.path()))
+            .unwrap();
+        luv(b.path(), &["merge", &ours]).unwrap();
+        for dir in [a.path(), b.path()] {
+            assert!(!dir.join("n.md").exists());
+            assert_eq!(
+                std::fs::read_to_string(dir.join("m.md")).unwrap(),
+                "1\n2\n3b\n"
+            );
+        }
     }
 
     fn tree(include: &[&str]) -> WorkTree {

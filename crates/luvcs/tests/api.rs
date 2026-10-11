@@ -1027,6 +1027,80 @@ fn rename_on_one_side_and_edit_on_the_other_merge_cleanly() {
 }
 
 #[test]
+fn set_title_keeps_the_body_and_refuses_conflicts() {
+    use base64::Engine as _;
+    let conn = Connection::open_in_memory().unwrap();
+    let host = host();
+    let repo = create(&conn, &host);
+    let saved = match run(
+        &conn,
+        &host,
+        VcsRequest::SaveBinary {
+            repo_id: repo.clone(),
+            object_id: None,
+            type_id: "image".into(),
+            data_base64: base64::engine::general_purpose::STANDARD.encode([0u8, 1, 2]),
+            title: Some("a.png".into()),
+        },
+    ) {
+        VcsResponse::Object { object } => object,
+        other => panic!("{other:?}"),
+    };
+    let set_title = |id: &str, title: Option<&str>| {
+        execute(
+            &conn,
+            &host.ctx(),
+            VcsRequest::SetTitle {
+                repo_id: repo.clone(),
+                object_id: id.into(),
+                title: title.map(str::to_owned),
+            },
+        )
+    };
+    match set_title(&saved.object_id, Some("img/b.png")) {
+        VcsResponse::Object { object } => {
+            assert_eq!(object.object_id, saved.object_id);
+            assert_eq!(object.title.as_deref(), Some("img/b.png"));
+            assert_eq!(object.blob, saved.blob);
+        }
+        other => panic!("{other:?}"),
+    }
+    match set_title(&saved.object_id, None) {
+        VcsResponse::Object { object } => assert_eq!(object.title, None),
+        other => panic!("{other:?}"),
+    }
+    // A well-formed ID of no object (the test host's random bytes are small
+    // counters, never 0xEE).
+    let missing = luvcs::id::ObjectId([0xEE; 16]).to_string();
+    match set_title(&missing, Some("x")) {
+        VcsResponse::Error { error } => assert_eq!(error.code, VcsErrorCode::NotFound),
+        other => panic!("{other:?}"),
+    }
+    match set_title("obj_!!", Some("x")) {
+        VcsResponse::Error { error } => assert_eq!(error.code, VcsErrorCode::Invalid),
+        other => panic!("{other:?}"),
+    }
+
+    // An object in conflict keeps its title until it is resolved.
+    let conn = Connection::open_in_memory().unwrap();
+    let (repo, id, conflicts) =
+        diverge_and_integrate(&conn, &host, ("A2\nB\n", "a.md"), ("A3\nB\n", "a.md"));
+    assert_eq!(conflicts.len(), 1);
+    match execute(
+        &conn,
+        &host.ctx(),
+        VcsRequest::SetTitle {
+            repo_id: repo,
+            object_id: id,
+            title: Some("b.md".into()),
+        },
+    ) {
+        VcsResponse::Error { error } => assert_eq!(error.code, VcsErrorCode::Conflict),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn resolving_a_content_conflict_keeps_the_agreed_title() {
     let conn = Connection::open_in_memory().unwrap();
     let host = host();
