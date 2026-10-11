@@ -42,9 +42,17 @@ A bookmark is a name pointing at a commit. There is no checked-out branch: a wor
 
 A bookmark's history is a DAG of immutable updates that travel like commits. Its state is computed from the set of updates alone, never from arrival order: per field (name, target, existence), the latest updates decide. A rename and a move made on two devices both land; two different moves, a delete against an edit, or two renames are kept as conflicts with every candidate, until someone chooses. Two moves that both went forward along one line of history agree on the furthest. Two devices can each make a bookmark of the same name; luv reports the shared name instead of picking one, and either can be renamed, deleted, or fused into the other. Undo of a bookmark change writes a new update rather than erasing one that may already be shared. The repo's default bookmark is kept the same way.
 
+### What leaves the device, and erasing it
+
+A push sends the shared history: the commits the heads and the bookmarks reach, with their trees, states and bodies, every bookmark update and redaction, the blobs those states name, and blobs the host stored with `PutBlob` (the host refers to those from outside the object model, so luv keeps them). Unrecorded work, amended-away commits and undone operations stay on the device.
+
+`Purge` erases the bodies a deleted object ever had (text, record, binary, conflict terms) from every commit. History is content-addressed, so IDs, trees and commits stay valid; only the bytes behind them go, and reading one reports it as `redacted`. The erasure is a `redaction` object that travels like a commit: every device that pulls it drops the bytes, and the next push asks the remote to drop them from the log entries before the one that carried it. A body another object on the purging device has too is kept; the check is made there, so a body only another device has under some other object is erased with the rest. Titles and commit descriptions are not erased, and a purge cannot be undone. Bytes written again after a purge (the same text saved anew) are new data and travel again.
+
+`Gc` deletes objects and blobs only this device has that nothing reaches any more: drafts of the working tree, and commits that were amended away or undone before they were pushed. It keeps whatever went through a remote, since another device may still build on it. With `keep_operations` it first forgets older operations, so undo stops there and what only they reached becomes garbage.
+
 ### IDs are keyed hashes
 
-Content IDs (content / state / tree / commit / conflict / blob / bookmark update) are HMAC-SHA256 under a per-repo key, over canonical CBOR, so the same value always encodes to the same bytes. A snapshot is a Patricia tree keyed by object ID. It has the same root regardless of insertion order, and commits share the subtrees that did not change.
+Content IDs (content / state / tree / commit / conflict / blob / bookmark update / redaction) are HMAC-SHA256 under a per-repo key, over canonical CBOR, so the same value always encodes to the same bytes. A snapshot is a Patricia tree keyed by object ID. It has the same root regardless of insertion order, and commits share the subtrees that did not change.
 
 The same content has different IDs in different repos. Blob deduplication also stays inside one repo.
 
@@ -97,7 +105,7 @@ repo = "notes"
 include = ["**/*.md"]
 ```
 
-`remote set` writes `.luv/remote.eure`, next to the store. `Luv.eure`, the file that is meant to travel with the files, never names a command, and `.luv`, `.git` and `.jj` are never tracked or restored at any depth, so files that come from someone else's history cannot change the remote or make `luv` run a command. `push` sends what the remote has not seen and never conflicts. `pull` takes the remote's history in and leaves your files alone. A remote is trusted like a secret: the first time a repo arrives from a remote, luv accepts the ID key that remote gives it, so pull only from remotes you trust. A second device starts with `remote set`, `pull`, then `init --repo <name>`, which attaches to the repo that was pulled, and `restore`.
+`remote set` writes `.luv/remote.eure`, next to the store. `Luv.eure`, the file that is meant to travel with the files, never names a command, and `.luv`, `.git` and `.jj` are never tracked or restored at any depth, so files that come from someone else's history cannot change the remote or make `luv` run a command. `push` sends the recorded history the remote has not seen and never conflicts. `pull` takes the remote's history in and leaves your files alone. A remote is trusted like a secret: the first time a repo arrives from a remote, luv accepts the ID key that remote gives it, so pull only from remotes you trust. A second device starts with `remote set`, `pull`, then `init --repo <name>`, which attaches to the repo that was pulled, and `restore`.
 
 After concurrent commits a repo has several heads, and `luv log` shows them all. `merge` merges one of them into your last commit and writes the merged files. A file in conflict is written with `<<<<<<< left` / `>>>>>>> right` markers around each conflicting region (the conflict itself is still stored as a `Conflict` object, not as markers); `status` lists it as `C`, and `commit` refuses until `resolve` settles it, by default with the file as you edited it on disk, or with one side whole (`--take`). A conflict that is no file in the work tree (outside the allowlist, say) is listed by its `obj_…` ID and settled with `--take`. `undo` and `redo` step through the operation log (a commit, a merge, a resolve, a save) and write the files back. `merge`, `undo` and `redo` refuse while files on disk differ from what is saved, so they never overwrite your edits.
 
@@ -120,6 +128,14 @@ Push follows the remote's advertised entry, blob chunk, and append limits.
 Remotes that omit limits use defaults of 1 MiB, 4 MiB, and 256 entries.
 A single object exceeding the entry limit is rejected with `too_large` before
 any remote write. Use `SaveBinary` / `PutBlob` for large binary content.
+
+After a `Purge`, push sends an `Erase` request: the remote drops the named
+objects from its `Objects` entries up to the entry that carried the
+redaction, turns the matching `Blob` entries into empty `Objects` entries
+(indexes stay dense), and deletes the blob chunks unless a later entry
+announces the blob again. A remote that does not implement it answers
+`unsupported`; the push still records what it sent, returns the error, and
+asks again next time.
 
 `RemoteError::is_retryable()` and `SyncError::is_retryable()` identify
 `locked` and `unavailable` as retryable errors. The host controls the delay

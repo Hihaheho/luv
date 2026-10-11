@@ -547,6 +547,7 @@ fn oversized_object_is_refused_before_any_remote_write() {
         None,
         &"x".repeat(luvcs_protocol::MAX_ENTRY_BYTES + 1),
     );
+    a.record(&repo, "big");
     a.run(VcsRequest::PutBlob {
         repo_id: repo.clone(),
         data_base64: "eA==".into(),

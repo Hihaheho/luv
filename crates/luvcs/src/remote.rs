@@ -17,14 +17,14 @@
 //! reader with any [`Remote`], which makes a directory a process remote and
 //! documents the protocol by example.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, Write};
 use std::sync::Mutex;
 
 use base64::Engine as _;
 use luvcs_protocol::{
-    Entry, EntryBody, MAX_READ_ENTRIES, PROTOCOL_VERSION, RemoteLimits, Request, Response,
-    error_code,
+    Entry, EntryBody, MAX_READ_ENTRIES, ObjectRef, PROTOCOL_VERSION, RemoteLimits, Request,
+    Response, error_code,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -95,6 +95,72 @@ pub fn check_append(entries: &[EntryBody], limits: RemoteLimits) -> RemoteResult
 
 pub type RemoteResult<T> = Result<T, RemoteError>;
 
+/// What one erase drops (see `luvcs_protocol::Request::Erase`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Erasure {
+    pub repo_id: String,
+    /// The index of the entry that carried the redaction: entries after it
+    /// are never touched, so bytes written again later survive.
+    pub through: u64,
+    pub objects: BTreeSet<ObjectRef>,
+    pub blob_ids: BTreeSet<String>,
+}
+
+impl Erasure {
+    /// `body`, the entry at `index`, with the erasure applied; `None` when
+    /// it is unchanged.
+    pub fn apply(&self, index: u64, body: &EntryBody) -> Option<EntryBody> {
+        if index > self.through {
+            return None;
+        }
+        match body {
+            EntryBody::Objects { repo_id, objects } if *repo_id == self.repo_id => {
+                let kept: Vec<_> = objects
+                    .iter()
+                    .filter(|o| {
+                        !self.objects.contains(&ObjectRef {
+                            kind: o.kind.clone(),
+                            logical_id_base64: o.logical_id_base64.clone(),
+                        })
+                    })
+                    .cloned()
+                    .collect();
+                (kept.len() != objects.len()).then(|| EntryBody::Objects {
+                    repo_id: repo_id.clone(),
+                    objects: kept,
+                })
+            }
+            // The announcement goes with the bytes, or a reader would wait
+            // for chunks that are gone.
+            EntryBody::Blob {
+                repo_id, blob_id, ..
+            } if *repo_id == self.repo_id && self.blob_ids.contains(blob_id) => {
+                Some(EntryBody::Objects {
+                    repo_id: repo_id.clone(),
+                    objects: Vec::new(),
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// The erased blob `body` (the entry at `index`) announces again after
+    /// the erasure point: its chunks are someone's new upload and stay.
+    pub fn reannounced<'b>(&self, index: u64, body: &'b EntryBody) -> Option<&'b str> {
+        match body {
+            EntryBody::Blob {
+                repo_id, blob_id, ..
+            } if index > self.through
+                && *repo_id == self.repo_id
+                && self.blob_ids.contains(blob_id) =>
+            {
+                Some(blob_id)
+            }
+            _ => None,
+        }
+    }
+}
+
 /// The client side of a remote.
 pub trait Remote {
     fn limits(&self) -> RemoteLimits {
@@ -122,6 +188,15 @@ pub trait Remote {
         blob_id: &str,
         index: u32,
     ) -> RemoteResult<Option<Vec<u8>>>;
+    /// Applies `erasure` and returns how many entries it rewrote. A remote
+    /// that cannot rewrite its log refuses with `unsupported`.
+    fn erase(&self, erasure: &Erasure) -> RemoteResult<u64> {
+        let _ = erasure;
+        Err(RemoteError::Refused {
+            code: error_code::UNSUPPORTED.into(),
+            message: "this remote cannot erase".into(),
+        })
+    }
 }
 
 fn check_chunk(bytes: &[u8], limits: RemoteLimits) -> RemoteResult<()> {
@@ -237,6 +312,28 @@ impl Remote for MemoryRemote {
             .get(&(repo_id.into(), blob_id.into(), index))
             .cloned())
     }
+
+    fn erase(&self, erasure: &Erasure) -> RemoteResult<u64> {
+        let mut state = self.state.lock().unwrap();
+        let mut rewritten = 0;
+        let mut reannounced = BTreeSet::new();
+        for (i, body) in state.log.iter_mut().enumerate() {
+            let index = i as u64 + 1;
+            if let Some(b) = erasure.reannounced(index, body) {
+                reannounced.insert(b.to_owned());
+            }
+            if let Some(new) = erasure.apply(index, body) {
+                *body = new;
+                rewritten += 1;
+            }
+        }
+        state.blobs.retain(|(repo, blob, _), _| {
+            *repo != erasure.repo_id
+                || !erasure.blob_ids.contains(blob)
+                || reannounced.contains(blob)
+        });
+        Ok(rewritten)
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -299,6 +396,19 @@ fn serve_one(remote: &dyn Remote, request: Request, backend: &str) -> RemoteResu
             data_base64: remote
                 .get_blob_chunk(&repo_id, &blob_id, index)?
                 .map(|b| base64::engine::general_purpose::STANDARD.encode(b)),
+        },
+        Request::Erase {
+            repo_id,
+            through,
+            objects,
+            blob_ids,
+        } => Response::Erased {
+            entries: remote.erase(&Erasure {
+                repo_id,
+                through,
+                objects: objects.into_iter().collect(),
+                blob_ids: blob_ids.into_iter().collect(),
+            })?,
         },
     })
 }
@@ -471,12 +581,96 @@ mod tests {
     #[test]
     fn memory_remote_meets_the_contract() {
         contract(&MemoryRemote::new());
+        erase_contract(&MemoryRemote::new());
     }
 
     #[test]
     fn dir_remote_meets_the_contract() {
         let dir = tempfile::tempdir().unwrap();
         contract(&DirRemote::open(dir.path()).unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        erase_contract(&DirRemote::open(dir.path()).unwrap());
+    }
+
+    fn object(kind: &str, id: &str) -> luvcs_protocol::WireObject {
+        luvcs_protocol::WireObject {
+            kind: kind.into(),
+            logical_id_base64: id.into(),
+            bytes_base64: "eA==".into(),
+        }
+    }
+
+    fn blob(id: &str) -> EntryBody {
+        EntryBody::Blob {
+            repo_id: "repo_a".into(),
+            blob_id: id.into(),
+            byte_length: 1,
+            raw_digest_hex: "00".into(),
+            chunk_count: 1,
+        }
+    }
+
+    /// What every remote that can erase must do.
+    fn erase_contract(remote: &dyn Remote) {
+        let objects = |ids: &[&str]| EntryBody::Objects {
+            repo_id: "repo_a".into(),
+            objects: ids.iter().map(|i| object("content", i)).collect(),
+        };
+        remote.put_blob_chunk("repo_a", "blob_x", 0, b"x").unwrap();
+        remote.put_blob_chunk("repo_a", "blob_y", 0, b"y").unwrap();
+        remote
+            .append(&[objects(&["AA==", "AQ=="]), blob("blob_x"), blob("blob_y")])
+            .unwrap();
+        remote.append(&[heads(1)]).unwrap();
+        // Written again after the redaction at index 4.
+        remote
+            .append(&[objects(&["AA=="]), blob("blob_y")])
+            .unwrap();
+        let erasure = Erasure {
+            repo_id: "repo_a".into(),
+            through: 4,
+            objects: [ObjectRef {
+                kind: "content".into(),
+                logical_id_base64: "AA==".into(),
+            }]
+            .into(),
+            blob_ids: ["blob_x".to_owned(), "blob_y".to_owned()].into(),
+        };
+        assert_eq!(remote.erase(&erasure).unwrap(), 3);
+        let log = remote.read(0, 10).unwrap();
+        assert_eq!(log.len(), 6);
+        assert_eq!(log[0].body, objects(&["AQ=="]));
+        assert_eq!(log[1].body, objects(&[]));
+        assert_eq!(log[2].body, objects(&[]));
+        assert_eq!(log[3].body, heads(1));
+        assert_eq!(log[4].body, objects(&["AA=="]));
+        assert_eq!(log[5].body, blob("blob_y"));
+        assert_eq!(remote.get_blob_chunk("repo_a", "blob_x", 0).unwrap(), None);
+        assert_eq!(
+            remote.get_blob_chunk("repo_a", "blob_y", 0).unwrap(),
+            Some(b"y".to_vec())
+        );
+        assert_eq!(remote.head().unwrap(), 6);
+        // Repeating it changes nothing.
+        assert_eq!(remote.erase(&erasure).unwrap(), 0);
+    }
+
+    #[test]
+    fn serve_erases_through_the_protocol() {
+        let remote = MemoryRemote::new();
+        remote
+            .append(&[EntryBody::Objects {
+                repo_id: "repo_a".into(),
+                objects: vec![object("content", "AA==")],
+            }])
+            .unwrap();
+        let input = r#"{"type":"erase","repo_id":"repo_a","through":1,"objects":[{"kind":"content","logical_id_base64":"AA=="}],"blob_ids":[]}"#;
+        let mut out = Vec::new();
+        serve(&remote, "memory", input.as_bytes(), &mut out).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<Response>(&out).unwrap(),
+            Response::Erased { entries: 1 }
+        );
     }
 
     #[test]

@@ -1,9 +1,14 @@
 //! Push and pull between a store and a [`Remote`].
 //!
 //! The remote is an ordered log (see `luvcs-protocol`). **Push** appends
-//! what the remote has not seen: the repo's creation, its immutable
-//! objects (bookmark updates among them), its blobs and the device's
-//! current heads. **Pull**
+//! what the remote has not seen of the repo's shared history: its
+//! creation, the commits the heads and bookmarks reach with their trees,
+//! states and bodies, every bookmark update and redaction, the blobs those
+//! states name (and the host's pinned blobs), and the device's current
+//! heads. Unrecorded work, amended-away commits and undone operations stay
+//! on the device. A redaction is followed by an erase: the remote drops
+//! the bytes it names from the entries up to the one that carried it.
+//! **Pull**
 //! reads the entries after the device's cursor and takes them in:
 //! objects are re-hashed under the repo's ID key before they are stored,
 //! heads are folded into the device's visible set the same way a local
@@ -26,8 +31,8 @@ use rusqlite::{Connection, OptionalExtension as _, params};
 use crate::api::{HostContext, LocalRepo, VcsError, ensure_local_schema, insert_local_repo};
 use crate::blob::{BlobError, MAX_BLOB_BYTES, SEGMENT_SIZE, blob_id, raw_digest};
 use crate::blob_store::{self, BlobStoreError};
-use crate::id::{BlobId, CommitId, IdKey, RealmId, RepoId, WorkspaceId};
-use crate::remote::{Remote, RemoteError};
+use crate::id::{BlobId, CommitId, IdKey, RealmId, RedactionId, RepoId, WorkspaceId};
+use crate::remote::{Erasure, Remote, RemoteError};
 use crate::store::{Store, StoreError};
 
 #[derive(Debug, thiserror::Error)]
@@ -66,6 +71,8 @@ pub struct PushReport {
     pub objects: usize,
     pub blobs: usize,
     pub heads_announced: bool,
+    /// Redactions the remote erased the bytes of in this push.
+    pub erased: usize,
     /// The remote's head after the push.
     pub head: u64,
 }
@@ -112,6 +119,14 @@ CREATE TABLE IF NOT EXISTS vcs_sync_wanted (
   raw_digest_hex TEXT NOT NULL,
   chunk_count INTEGER NOT NULL,
   PRIMARY KEY (remote, repo_id, blob_id)
+) STRICT;
+CREATE TABLE IF NOT EXISTS vcs_sync_redactions (
+  remote TEXT NOT NULL,
+  repo_id BLOB NOT NULL,
+  redaction_id BLOB NOT NULL,
+  entry_index INTEGER NOT NULL,
+  erased INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (remote, repo_id, redaction_id)
 ) STRICT;
 CREATE TABLE IF NOT EXISTS vcs_sync_heads (
   remote TEXT NOT NULL,
@@ -189,28 +204,76 @@ pub fn push(
         });
     }
 
-    // 2. Objects the remote has not seen, in entries of bounded size.
-    let mut pushed: Vec<(String, Vec<u8>)> = Vec::new();
-    {
-        let mut stmt = conn.prepare(
-            "SELECT o.kind, o.logical_id, o.bytes FROM vcs_objects o
-             WHERE o.repo_id = ?1 AND NOT EXISTS (
-               SELECT 1 FROM vcs_sync_pushed p
-               WHERE p.remote = ?2 AND p.repo_id = o.repo_id
-                 AND p.kind = o.kind AND p.logical_id = o.logical_id)
-             ORDER BY o.kind, o.logical_id",
-        )?;
-        let rows = stmt.query_map(params![rid.to_vec(), remote_name], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, Vec<u8>>(1)?,
-                r.get::<_, Vec<u8>>(2)?,
-            ))
+    // 2. Objects of the shared history the remote has not seen, in
+    //    entries of bounded size. A commit, tree or state the remote has
+    //    holds everything under it, so the walk stops there; the one
+    //    exception, a body a redaction erased that was written again, is
+    //    added on its own.
+    let is_pushed = |kind: &str, id: &[u8]| -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT count(*) > 0 FROM vcs_sync_pushed
+             WHERE remote = ?1 AND repo_id = ?2 AND kind = ?3 AND logical_id = ?4",
+            params![remote_name, rid.to_vec(), kind, id],
+            |r| r.get(0),
+        )
+    };
+    let roots = repo.shared_roots()?;
+    let reach = repo.reach_until(&roots, &mut |kind, id| Ok(is_pushed(kind, id)?))?;
+    let (mut contents_again, mut blobs_again) = (Vec::new(), Vec::new());
+    let (contents, blobs) = repo.written_again()?;
+    for c in contents {
+        if !is_pushed("content", c.as_bytes())? {
+            contents_again.push(c);
+        }
+    }
+    for b in blobs {
+        if !blob_known(conn, remote_name, rid, b)? {
+            blobs_again.push(b);
+        }
+    }
+    if !contents_again.is_empty() || !blobs_again.is_empty() {
+        // Rare (erased bytes written again). Only a commit not pushed yet
+        // can name them anew: the old ones still name them as erased, and
+        // a draft that happens to repeat them stays here.
+        let full = repo.reach_until(&roots, &mut |kind, id| {
+            Ok(kind == "commit" && is_pushed(kind, id)?)
         })?;
+        contents_again.retain(|c| full.objects.contains(&("content", c.to_vec())));
+        blobs_again.retain(|b| full.blobs.contains(b));
+    }
+    let mut wanted: Vec<(String, Vec<u8>)> = reach
+        .objects
+        .iter()
+        .map(|(k, i)| ((*k).to_owned(), i.clone()))
+        .chain(
+            contents_again
+                .iter()
+                .map(|c| ("content".to_owned(), c.to_vec())),
+        )
+        .collect();
+    for kind in ["bookmark_update", "redaction"] {
+        wanted.extend(
+            repo.object_ids(kind)?
+                .into_iter()
+                .map(|i| (kind.to_owned(), i)),
+        );
+    }
+    wanted.sort();
+    wanted.dedup();
+    let mut pushed: Vec<(String, Vec<u8>)> = Vec::new();
+    // Redactions and the index of the body that carries each.
+    let mut redactions: Vec<(Vec<u8>, usize)> = Vec::new();
+    {
         let mut group: Vec<WireObject> = Vec::new();
         let mut group_bytes = 0usize;
-        for row in rows {
-            let (kind, logical_id, bytes) = row?;
+        for (kind, logical_id) in wanted {
+            if is_pushed(&kind, &logical_id)? {
+                continue;
+            }
+            // A body erased by a redaction is reached but no longer here.
+            let Some(bytes) = repo.object_bytes(&kind, &logical_id)? else {
+                continue;
+            };
             if bytes.len() > limits.max_entry_bytes as usize {
                 return Err(RemoteError::Refused {
                     code: luvcs_protocol::error_code::TOO_LARGE.into(),
@@ -237,6 +300,9 @@ pub fn push(
                 logical_id_base64: B64.encode(&logical_id),
                 bytes_base64: B64.encode(&bytes),
             });
+            if kind == "redaction" {
+                redactions.push((logical_id.clone(), bodies.len()));
+            }
             pushed.push((kind, logical_id));
         }
         if !group.is_empty() {
@@ -252,14 +318,14 @@ pub fn push(
     //    names bytes the remote does not have.
     let realm_id = RealmId(rid.0);
     let mut uploaded: Vec<BlobId> = Vec::new();
-    for info in blob_store::list(conn, realm_id)? {
-        let id = info.blob_ref.blob_id;
-        let known: bool = conn.query_row(
-            "SELECT count(*) > 0 FROM vcs_sync_blobs WHERE remote = ?1 AND repo_id = ?2 AND blob_id = ?3",
-            params![remote_name, rid.to_vec(), id.to_vec()],
-            |r| r.get(0),
-        )?;
-        if known {
+    let mut blobs = reach.blobs.clone();
+    blobs.extend(blob_store::pinned(conn, realm_id)?);
+    blobs.extend(blobs_again);
+    for id in blobs {
+        let Some(info) = blob_store::stat(conn, realm_id, id)? else {
+            continue;
+        };
+        if blob_known(conn, remote_name, rid, id)? {
             continue;
         }
         let length = info.blob_ref.byte_length;
@@ -301,12 +367,16 @@ pub fn push(
         report.heads_announced = true;
     }
 
+    // The log index each body landed at.
+    let mut indexes: Vec<u64> = Vec::with_capacity(bodies.len());
     report.head = if bodies.is_empty() {
         remote.head()?
     } else {
         let mut head = 0;
         for batch in bodies.chunks(limits.max_append_entries as usize) {
             head = remote.append(batch)?;
+            let first = head + 1 - batch.len() as u64;
+            indexes.extend((0..batch.len() as u64).map(|i| first + i));
         }
         head
     };
@@ -329,6 +399,13 @@ pub fn push(
             params![remote_name, rid.to_vec(), id.to_vec()],
         )?;
     }
+    for (id, body) in &redactions {
+        tx.execute(
+            "INSERT OR IGNORE INTO vcs_sync_redactions (remote, repo_id, redaction_id, entry_index)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![remote_name, rid.to_vec(), id, indexes[*body] as i64],
+        )?;
+    }
     if report.heads_announced {
         tx.execute(
             "INSERT INTO vcs_sync_heads (remote, repo_id, announced) VALUES (?1, ?2, ?3)
@@ -337,7 +414,66 @@ pub fn push(
         )?;
     }
     tx.commit()?;
+
+    // 5. Erase what redactions name from the entries before them: those
+    //    this push carried, those pulled from this remote, and those an
+    //    earlier push could not erase. What is pushed stays recorded if
+    //    the remote refuses; the next push asks again.
+    report.erased = erase_redacted(conn, &repo, remote, remote_name, rid)?;
     Ok(report)
+}
+
+/// Asks `remote` to erase every redaction of `rid` it carries that this
+/// device has not had it erase yet; returns how many it erased.
+fn erase_redacted<D: crate::digest::Digest>(
+    conn: &Connection,
+    repo: &crate::store::Repo<'_, '_, D>,
+    remote: &dyn Remote,
+    remote_name: &str,
+    rid: RepoId,
+) -> Result<usize> {
+    let pending: Vec<(Vec<u8>, i64)> = {
+        let mut stmt = conn.prepare(
+            "SELECT redaction_id, entry_index FROM vcs_sync_redactions
+             WHERE remote = ?1 AND repo_id = ?2 AND erased = 0 ORDER BY entry_index",
+        )?;
+        let rows = stmt.query_map(params![remote_name, rid.to_vec()], |r| {
+            Ok((r.get::<_, Vec<u8>>(0)?, r.get::<_, i64>(1)?))
+        })?;
+        rows.collect::<rusqlite::Result<_>>()?
+    };
+    for (id, through) in &pending {
+        let id = RedactionId::from_bytes(id).map_err(|e| log_err("redaction id", e))?;
+        let redaction = repo.redaction(id)?;
+        remote.erase(&Erasure {
+            repo_id: rid.to_string(),
+            through: *through as u64,
+            objects: redaction
+                .contents
+                .iter()
+                .map(|c| luvcs_protocol::ObjectRef {
+                    kind: "content".into(),
+                    logical_id_base64: B64.encode(c.as_bytes()),
+                })
+                .collect(),
+            blob_ids: redaction.blobs.iter().map(ToString::to_string).collect(),
+        })?;
+        conn.execute(
+            "UPDATE vcs_sync_redactions SET erased = 1
+             WHERE remote = ?1 AND repo_id = ?2 AND redaction_id = ?3",
+            params![remote_name, rid.to_vec(), id.to_vec()],
+        )?;
+    }
+    Ok(pending.len())
+}
+
+/// Whether `remote_name` is known to hold blob `id` of `rid`.
+fn blob_known(conn: &Connection, remote_name: &str, rid: RepoId, id: BlobId) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT count(*) > 0 FROM vcs_sync_blobs WHERE remote = ?1 AND repo_id = ?2 AND blob_id = ?3",
+        params![remote_name, rid.to_vec(), id.to_vec()],
+        |r| r.get(0),
+    )?)
 }
 
 /// A canonical text of the heads, to tell whether they changed.
@@ -396,7 +532,7 @@ pub fn pull(
                     format!("expected {}, got {}", cursor + 1, entry.index),
                 ));
             }
-            apply(conn, host, remote_name, &entry.body, &mut report)?;
+            apply(conn, host, remote_name, &entry, &mut report)?;
             cursor = entry.index;
             conn.execute(
                 "INSERT INTO vcs_sync_cursor (remote, last_index) VALUES (?1, ?2)
@@ -438,10 +574,10 @@ fn apply(
     conn: &Connection,
     host: &HostContext<'_>,
     remote_name: &str,
-    body: &EntryBody,
+    entry: &luvcs_protocol::Entry,
     report: &mut PullReport,
 ) -> Result<()> {
-    match body {
+    match &entry.body {
         EntryBody::RepoCreated {
             repo_id,
             name,
@@ -507,10 +643,22 @@ fn apply(
             report.objects += repo.import_objects(&decoded)?;
             let tx = conn.unchecked_transaction()?;
             for (kind, logical_id, _) in &decoded {
+                // A body a redaction in this same entry erased is not on
+                // the remote either (the erase reaches this entry).
+                if repo.object_bytes(kind, logical_id)?.is_none() {
+                    continue;
+                }
                 tx.execute(
                     "INSERT OR IGNORE INTO vcs_sync_pushed (remote, repo_id, kind, logical_id) VALUES (?1, ?2, ?3, ?4)",
                     params![remote_name, repo_id.to_vec(), kind, logical_id],
                 )?;
+                if kind == "redaction" {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO vcs_sync_redactions (remote, repo_id, redaction_id, entry_index)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![remote_name, repo_id.to_vec(), logical_id, entry.index as i64],
+                    )?;
+                }
             }
             tx.commit()?;
         }

@@ -203,6 +203,66 @@ impl Remote for DirRemote {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// Rewrites each log file that holds an erased entry (a whole new file
+    /// renamed over the old one, so a reader sees one or the other). Two
+    /// erasers rewriting one file at once may write back what the other
+    /// removed, so the log is read again until a pass changes nothing.
+    fn erase(&self, erasure: &Erasure) -> RemoteResult<u64> {
+        check_name("repo id", &erasure.repo_id)?;
+        for blob in &erasure.blob_ids {
+            check_name("blob id", blob)?;
+        }
+        let mut rewritten = 0;
+        for _ in 0..APPEND_ATTEMPTS {
+            let mut changed_any = false;
+            let mut reannounced = BTreeSet::new();
+            for (first, path) in self.log_files()? {
+                let bodies = Self::read_file(&path)?;
+                let mut changed = false;
+                let mut out = Vec::with_capacity(bodies.len());
+                for (offset, body) in bodies.into_iter().enumerate() {
+                    let index = first + offset as u64;
+                    if let Some(blob) = erasure.reannounced(index, &body) {
+                        reannounced.insert(blob.to_owned());
+                    }
+                    match erasure.apply(index, &body) {
+                        Some(new) => {
+                            out.push(new);
+                            changed = true;
+                            rewritten += 1;
+                        }
+                        None => out.push(body),
+                    }
+                }
+                if changed {
+                    let tmp = self.tmp_path();
+                    write_private(
+                        &tmp,
+                        &serde_json::to_vec(&out)
+                            .map_err(|e| RemoteError::Protocol(e.to_string()))?,
+                    )?;
+                    std::fs::rename(&tmp, &path)?;
+                    changed_any = true;
+                }
+            }
+            if !changed_any {
+                for blob in erasure.blob_ids.difference(&reannounced) {
+                    let dir = self.root.join("blobs").join(&erasure.repo_id).join(blob);
+                    match std::fs::remove_dir_all(&dir) {
+                        Ok(()) => {}
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                        Err(e) => return Err(e.into()),
+                    }
+                }
+                return Ok(rewritten);
+            }
+        }
+        Err(RemoteError::Refused {
+            code: error_code::LOCKED.into(),
+            message: "log is too contended to erase".into(),
+        })
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -401,6 +461,18 @@ impl Remote for ProcessRemote {
                 Ok(Some(bytes))
             }
             other => Err(unexpected("a blob chunk", other)),
+        }
+    }
+
+    fn erase(&self, erasure: &Erasure) -> RemoteResult<u64> {
+        match self.call(&Request::Erase {
+            repo_id: erasure.repo_id.clone(),
+            through: erasure.through,
+            objects: erasure.objects.iter().cloned().collect(),
+            blob_ids: erasure.blob_ids.iter().cloned().collect(),
+        })? {
+            Response::Erased { entries } => Ok(entries),
+            other => Err(unexpected("an erase receipt", other)),
         }
     }
 }

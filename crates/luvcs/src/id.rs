@@ -190,6 +190,10 @@ fixed_id!(
     /// Keyed ID of one bookmark (or repo setting) update.
     BookmarkUpdateId, 32, "bmu_"
 );
+fixed_id!(
+    /// Keyed ID of a redaction: the record that some bytes were erased.
+    RedactionId, 32, "rdc_"
+);
 
 /// Domain separation for keyed IDs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -200,6 +204,7 @@ pub enum Domain {
     Commit,
     Conflict,
     BookmarkUpdate,
+    Redaction,
 }
 
 impl Domain {
@@ -211,6 +216,7 @@ impl Domain {
             Domain::Commit => "commit",
             Domain::Conflict => "conflict",
             Domain::BookmarkUpdate => "bookmark_update",
+            Domain::Redaction => "redaction",
         }
     }
 }

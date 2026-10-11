@@ -24,10 +24,13 @@ use crate::model::{
     CoreError, ObjectBody, ObjectState, TermKind,
 };
 use crate::record::{RecordSchema, RecordValue};
+use crate::redaction::Redaction;
 use crate::tree::{self, Node, TreeError};
 
 mod bookmarks;
+mod retention;
 pub use bookmarks::{Advance, BookmarkEdit, BookmarkEntry};
+pub use retention::{GcOutcome, PurgeOutcome, Reach, Roots};
 
 pub const STORE_SCHEMA_VERSION: u32 = 1;
 
@@ -55,6 +58,8 @@ pub enum StoreError {
     UnknownCommit(CommitId),
     #[error("object {kind} {id} is not in this store")]
     MissingObject { kind: &'static str, id: String },
+    #[error("{kind} {id} was redacted")]
+    Redacted { kind: &'static str, id: String },
     #[error("workspace token is {actual}, expected {expected}")]
     StaleToken { expected: u64, actual: u64 },
     #[error("logical id {id} already holds different bytes")]
@@ -292,6 +297,12 @@ CREATE TABLE IF NOT EXISTS vcs_operations (
   undone INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 CREATE UNIQUE INDEX IF NOT EXISTS vcs_operations_id ON vcs_operations (repo_id, operation_id);
+CREATE TABLE IF NOT EXISTS vcs_redacted (
+  repo_id BLOB NOT NULL,
+  kind TEXT NOT NULL,
+  logical_id BLOB NOT NULL,
+  PRIMARY KEY (repo_id, kind, logical_id)
+) STRICT;
 CREATE TABLE IF NOT EXISTS vcs_operation_objects (
   repo_id BLOB NOT NULL,
   operation_id BLOB NOT NULL,
@@ -533,6 +544,7 @@ pub fn has_commit_object(
 }
 const KIND_CONFLICT: &str = "conflict";
 const KIND_BOOKMARK_UPDATE: &str = "bookmark_update";
+const KIND_REDACTION: &str = "redaction";
 
 /// Read side shared by `Repo` and the in-transaction executor.
 struct Reader<'a> {
@@ -1707,6 +1719,13 @@ impl<D: Digest> Repo<'_, '_, D> {
                     }
                     u.id(&self.store.digest, &self.key)?.to_vec()
                 }
+                KIND_REDACTION => {
+                    let r = Redaction::decode(data, &self.store.caps)?;
+                    if r.repo_id != self.repo_id {
+                        return Err(bad("redaction of another repo"));
+                    }
+                    r.id(&self.store.digest, &self.key)?.to_vec()
+                }
                 _ => return Err(bad("unknown object kind")),
             };
             if expected != id {
@@ -1720,11 +1739,16 @@ impl<D: Digest> Repo<'_, '_, D> {
                 KIND_TREE => KIND_TREE,
                 KIND_COMMIT => KIND_COMMIT,
                 KIND_BOOKMARK_UPDATE => KIND_BOOKMARK_UPDATE,
+                KIND_REDACTION => KIND_REDACTION,
                 _ => KIND_CONFLICT,
             };
             Self::put_object_tx(tx, self.repo_id.as_bytes(), kind_static, id, data)?;
             if kind == KIND_BOOKMARK_UPDATE {
                 bookmarks::index_tx(tx, self.repo_id, id, data, &self.store.caps)?;
+            }
+            if kind == KIND_REDACTION {
+                let r = Redaction::decode(data, &self.store.caps)?;
+                retention::apply_redaction_tx(tx, self.repo_id, &r)?;
             }
             if kind == KIND_COMMIT {
                 let c = Commit::decode(data, &self.store.caps)?;
@@ -1739,6 +1763,16 @@ impl<D: Digest> Repo<'_, '_, D> {
         }
         Ok(count)
     }
+}
+
+/// What every conflict an object merge records is made of, apart from its
+/// driver and terms.
+struct ConflictFrame {
+    object_id: ObjectId,
+    base: Vec<ObjectStateId>,
+    sides: Vec<ObjectStateId>,
+    type_hint: String,
+    meta: MetadataMerge,
 }
 
 /// What one object's three-way merge produced.
@@ -1839,12 +1873,19 @@ impl<D: Digest> Executor<'_, '_, D> {
         Ok(ObjectState::decode(&bytes, self.caps)?)
     }
 
-    fn content(&self, id: ContentId) -> Result<Vec<u8>> {
-        self.object(KIND_CONTENT, id.as_bytes())?
-            .ok_or_else(|| StoreError::MissingObject {
-                kind: KIND_CONTENT,
-                id: id.to_string(),
-            })
+    /// A body, or `None` when a redaction erased it; a body that is
+    /// missing for any other reason is an error.
+    fn content_unless_redacted(&self, id: ContentId) -> Result<Option<Vec<u8>>> {
+        if let Some(bytes) = self.object(KIND_CONTENT, id.as_bytes())? {
+            return Ok(Some(bytes));
+        }
+        if self.reader().is_redacted(KIND_CONTENT, id.as_bytes())? {
+            return Ok(None);
+        }
+        Err(StoreError::MissingObject {
+            kind: KIND_CONTENT,
+            id: id.to_string(),
+        })
     }
 
     fn tree_entries(&self, root: TreeId) -> Result<BTreeMap<ObjectId, ObjectStateId>> {
@@ -2150,12 +2191,27 @@ impl<D: Digest> Executor<'_, '_, D> {
                         ObjectBody::Text { content: rc },
                         base_body,
                     ) if l.type_id == r.type_id => {
+                        // An erased base merges as no base; an erased side
+                        // cannot be merged line by line.
                         let base_bytes = match base_body {
-                            Some(ObjectBody::Text { content }) => Some(self.content(*content)?),
+                            Some(ObjectBody::Text { content }) => {
+                                self.content_unless_redacted(*content)?
+                            }
                             _ => None,
                         };
-                        let lb = self.content(*lc)?;
-                        let rb = self.content(*rc)?;
+                        let (Some(lb), Some(rb)) = (
+                            self.content_unless_redacted(*lc)?,
+                            self.content_unless_redacted(*rc)?,
+                        ) else {
+                            let frame = ConflictFrame {
+                                object_id,
+                                base: base_ids,
+                                sides,
+                                type_hint,
+                                meta,
+                            };
+                            return self.whole_object_conflict(frame, &ls, &rs);
+                        };
                         match merge::text::merge_text(base_bytes.as_deref(), &lb, &rb) {
                             merge::text::TextMergeOutcome::Merged(bytes) => {
                                 let content = self.put_content(&bytes)?;
@@ -2207,13 +2263,27 @@ impl<D: Digest> Executor<'_, '_, D> {
                             .cloned()
                             .ok_or_else(|| StoreError::UnknownSchema(ls_.clone()))?;
                         let base_rec = match base_body {
-                            Some(ObjectBody::Record { content, .. }) => {
-                                Some(RecordValue::decode(&self.content(*content)?)?)
-                            }
+                            Some(ObjectBody::Record { content, .. }) => self
+                                .content_unless_redacted(*content)?
+                                .map(|b| RecordValue::decode(&b))
+                                .transpose()?,
                             _ => None,
                         };
-                        let lr = RecordValue::decode(&self.content(*lc)?)?;
-                        let rr = RecordValue::decode(&self.content(*rc)?)?;
+                        let (Some(lb), Some(rb)) = (
+                            self.content_unless_redacted(*lc)?,
+                            self.content_unless_redacted(*rc)?,
+                        ) else {
+                            let frame = ConflictFrame {
+                                object_id,
+                                base: base_ids,
+                                sides,
+                                type_hint,
+                                meta,
+                            };
+                            return self.whole_object_conflict(frame, &ls, &rs);
+                        };
+                        let lr = RecordValue::decode(&lb)?;
+                        let rr = RecordValue::decode(&rb)?;
                         match merge::record::merge_record(&schema, base_rec.as_ref(), &lr, &rr) {
                             merge::record::RecordMergeOutcome::Merged(v) => {
                                 let content = self.put_content(&v.encode()?)?;
@@ -2282,24 +2352,54 @@ impl<D: Digest> Executor<'_, '_, D> {
             }
         };
         let (merged, terms) = outcome;
-        let conflict = Conflict {
-            format: CONFLICT_FORMAT_V1,
+        let frame = ConflictFrame {
             object_id,
-            driver: driver.to_owned(),
             base: base_ids,
             sides,
+            type_hint,
+            meta,
+        };
+        self.finish_conflict(frame, driver, merged, terms)
+    }
+
+    /// A conflict over the whole object, for bodies that cannot be merged
+    /// by content (one of them was erased by a redaction).
+    fn whole_object_conflict(
+        &mut self,
+        frame: ConflictFrame,
+        ls: &Option<ObjectState>,
+        rs: &Option<ObjectState>,
+    ) -> Result<ObjectMerge> {
+        let mut terms = vec![whole_object_term(ls, rs)];
+        terms.extend(self.metadata_terms(&frame.meta.conflicts)?);
+        self.finish_conflict(frame, "merge.object.v1", None, terms)
+    }
+
+    fn finish_conflict(
+        &mut self,
+        frame: ConflictFrame,
+        driver: &str,
+        merged: Option<ContentId>,
+        terms: Vec<ConflictTerm>,
+    ) -> Result<ObjectMerge> {
+        let conflict = Conflict {
+            format: CONFLICT_FORMAT_V1,
+            object_id: frame.object_id,
+            driver: driver.to_owned(),
+            base: frame.base,
+            sides: frame.sides,
             merged,
             terms,
         };
         let conflict_id = self.put_conflict(&conflict)?;
         let state = ObjectState::new(
-            object_id,
-            type_hint,
+            frame.object_id,
+            frame.type_hint,
             ObjectBody::Conflict {
                 conflict: conflict_id,
             },
         )
-        .with_metadata(meta.merged);
+        .with_metadata(frame.meta.merged);
         let state_id = self.put_state(&state)?;
         Ok(ObjectMerge::Conflict(state_id, conflict_id))
     }

@@ -89,6 +89,7 @@ impl From<StoreError> for VcsError {
             StoreError::RepoExists(_)
             | StoreError::IdentityConflict { .. }
             | StoreError::NameTaken(_) => VcsErrorCode::Conflict,
+            StoreError::Redacted { .. } => VcsErrorCode::Redacted,
             StoreError::NothingToRecord => VcsErrorCode::NothingToRecord,
             StoreError::UnrecordedChanges => VcsErrorCode::UnrecordedChanges,
             StoreError::Core(crate::model::CoreError::Unsupported { .. }) => {
@@ -590,12 +591,19 @@ impl<D: Digest> Session<'_, '_, '_, D> {
     fn blob_info(&self, blob_id: &str) -> ApiResult<(RealmId, BlobId, VcsBlobInfo)> {
         let realm = self.realm();
         let id: BlobId = parse("blob id", blob_id)?;
-        let info = blob_store::stat(self.repo.connection(), realm.id, id)?.ok_or_else(|| {
-            VcsError::new(
+        let Some(info) = blob_store::stat(self.repo.connection(), realm.id, id)? else {
+            if self.repo.is_redacted_blob(id)? {
+                return Err(StoreError::Redacted {
+                    kind: "blob",
+                    id: id.to_string(),
+                }
+                .into());
+            }
+            return Err(VcsError::new(
                 VcsErrorCode::NotFound,
                 format!("blob {id} is not on this device"),
-            )
-        })?;
+            ));
+        };
         Ok((realm.id, id, blob_info_view(&info)))
     }
 
@@ -734,11 +742,13 @@ impl<D: Digest> Session<'_, '_, '_, D> {
             conflict: None,
             blob: None,
             metadata_json: cbor_to_json(&state.metadata).to_string(),
+            redacted: false,
         };
         match &state.body {
             ObjectBody::Text { content } => {
                 view.body_kind = "text".into();
                 view.text = self.content_text(*content)?;
+                view.redacted = self.repo.is_redacted_content(*content)?;
             }
             ObjectBody::Record { content, schema } => {
                 view.body_kind = "record".into();
@@ -748,10 +758,16 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                         .map_err(|e| VcsError::new(VcsErrorCode::Internal, e.to_string()))?;
                     view.record_json = Some(record_to_json(&record).to_string());
                 }
+                view.redacted = self.repo.is_redacted_content(*content)?;
             }
             ObjectBody::Binary { blob } => {
                 view.body_kind = "binary".into();
-                view.blob = Some(self.blob_ref_view(blob)?);
+                let blob = self.blob_ref_view(blob)?;
+                view.redacted = !blob.present
+                    && self
+                        .repo
+                        .is_redacted_blob(parse("blob id", &blob.blob_id)?)?;
+                view.blob = Some(blob);
             }
             ObjectBody::Conflict { conflict } => {
                 view.body_kind = "conflict".into();
@@ -971,6 +987,7 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                     &bytes,
                     self.host.now_unix_ms,
                 )?;
+                blob_store::pin(self.repo.connection(), realm.id, blob_ref.blob_id)?;
                 let (_, _, blob) = self.blob_info(&blob_ref.blob_id.to_string())?;
                 VcsResponse::Blob { blob }
             }
@@ -1375,6 +1392,48 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                     advance: advance_view(advance),
                 }
             }
+            VcsRequest::Purge {
+                object_ids,
+                blob_ids,
+                reason,
+                ..
+            } => {
+                let objects = object_ids
+                    .iter()
+                    .map(|s| parse::<ObjectId>("object id", s))
+                    .collect::<ApiResult<Vec<_>>>()?;
+                let blobs = blob_ids
+                    .iter()
+                    .map(|s| parse::<BlobId>("blob id", s))
+                    .collect::<ApiResult<Vec<_>>>()?;
+                // The workspace is checked like any head: create it first.
+                self.workspace()?;
+                let out = self.repo.purge(
+                    &objects,
+                    &blobs,
+                    &self.host.actor(),
+                    self.host.now_unix_ms,
+                    &reason,
+                )?;
+                VcsResponse::Purged {
+                    redaction_ids: out.redactions.iter().map(ToString::to_string).collect(),
+                    contents: out.contents as u32,
+                    blobs: out.blobs as u32,
+                    kept_shared: out.kept_shared as u32,
+                }
+            }
+            VcsRequest::Gc {
+                keep_operations, ..
+            } => {
+                let out = self
+                    .repo
+                    .collect_garbage(keep_operations.map(|n| n as usize))?;
+                VcsResponse::Collected {
+                    objects: out.objects as u32,
+                    blobs: out.blobs as u32,
+                    operations: out.operations as u32,
+                }
+            }
             VcsRequest::Export { .. } => {
                 let bytes = self.repo.export_archive()?;
                 let working = self.workspace()?.working;
@@ -1433,6 +1492,8 @@ fn repo_id_of(request: &VcsRequest) -> Option<&str> {
         | VcsRequest::SetDefaultBookmark { repo_id, .. }
         | VcsRequest::SelectBookmark { repo_id, .. }
         | VcsRequest::RecordAdvancing { repo_id, .. }
+        | VcsRequest::Purge { repo_id, .. }
+        | VcsRequest::Gc { repo_id, .. }
         | VcsRequest::Export { repo_id } => Some(repo_id),
     }
 }

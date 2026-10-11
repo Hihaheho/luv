@@ -62,6 +62,9 @@ pub mod error_code {
     pub const UNAVAILABLE: &str = "unavailable";
     pub const INVALID: &str = "invalid";
     pub const UNSUPPORTED_PROTOCOL: &str = "unsupported_protocol";
+    /// The remote does not implement the request (an older remote asked to
+    /// erase, say).
+    pub const UNSUPPORTED: &str = "unsupported";
     pub const INTERNAL: &str = "internal";
 
     pub fn is_retryable(code: &str) -> bool {
@@ -116,6 +119,13 @@ pub struct WireObject {
     pub kind: String,
     pub logical_id_base64: String,
     pub bytes_base64: String,
+}
+
+/// An object named without its bytes.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct ObjectRef {
+    pub kind: String,
+    pub logical_id_base64: String,
 }
 
 /// What a client appends to the log.
@@ -189,6 +199,18 @@ pub enum Request {
         blob_id: String,
         index: u32,
     },
+    /// Drops `objects` from the `Objects` entries of `repo_id` at index
+    /// `through` or before, and turns the `Blob` entries of `blob_ids`
+    /// there into empty `Objects` entries; indexes stay dense and later
+    /// entries are untouched. A blob's chunks are deleted unless a later
+    /// `Blob` entry announces it again. Sent by a client that took in a
+    /// redaction at entry `through`; repeating it changes nothing.
+    Erase {
+        repo_id: String,
+        through: u64,
+        objects: Vec<ObjectRef>,
+        blob_ids: Vec<String>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +238,10 @@ pub enum Response {
     /// `None` when the chunk is not in the store.
     BlobChunk {
         data_base64: Option<String>,
+    },
+    /// How many entries an erase rewrote.
+    Erased {
+        entries: u64,
     },
     Error {
         code: String,

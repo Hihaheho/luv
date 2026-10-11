@@ -61,7 +61,9 @@ pub enum VcsRequest {
         title: Option<String>,
     },
     /// Stores bytes as a local blob of the repo's realm without touching
-    /// the working tree.
+    /// the working tree. The blob is pinned: the host refers to it from
+    /// outside the object model (a record field, say), so push sends it and
+    /// `Gc` keeps it until a `Purge` names it.
     PutBlob {
         repo_id: String,
         data_base64: String,
@@ -228,6 +230,33 @@ pub enum VcsRequest {
     Export {
         repo_id: String,
     },
+    /// Erases from all history the bodies `object_ids` ever had (text,
+    /// record, binary, conflict terms) and the pinned blobs `blob_ids`. The
+    /// objects must be deleted (or absent) in every head and in the working
+    /// tree. IDs, titles and commit descriptions stay; reading an erased
+    /// body reports `redacted`. A body another object here also has is
+    /// kept (only this device's objects are known to the check).
+    /// The erasure travels with the next push: every device that pulls it
+    /// drops the bytes, and the remote drops them from its log. `reason`
+    /// travels too, so it must not repeat what is erased. No undo.
+    Purge {
+        repo_id: String,
+        object_ids: Vec<String>,
+        #[serde(default)]
+        blob_ids: Vec<String>,
+        reason: String,
+    },
+    /// Deletes objects and blobs this device alone has that nothing
+    /// reaches any more: drafts of the working tree, amended-away and
+    /// undone commits that were never pushed. With `keep_operations`, first
+    /// forgets all but that many newest operations (undo stops there).
+    /// Anything pushed or pulled is kept.
+    Gc {
+        repo_id: String,
+        #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
+        keep_operations: Option<u32>,
+    },
     /// Imports an exported archive as a new local repo. The archive names
     /// the repo; `id_key_base64` is the repo's ID key as the export gave it.
     Import {
@@ -323,6 +352,19 @@ pub enum VcsResponse {
         repo: VcsRepoInfo,
         objects: u32,
     },
+    Purged {
+        /// Empty when there was nothing left to erase.
+        redaction_ids: Vec<String>,
+        contents: u32,
+        blobs: u32,
+        /// Bodies kept because another object has the same bytes.
+        kept_shared: u32,
+    },
+    Collected {
+        objects: u32,
+        blobs: u32,
+        operations: u32,
+    },
     Blob {
         blob: VcsBlobInfo,
     },
@@ -374,6 +416,8 @@ pub enum VcsErrorCode {
     UnrecordedChanges,
     Conflict,
     Unsupported,
+    /// The bytes were erased by a redaction (see `Purge`).
+    Redacted,
     Host,
     Internal,
 }
@@ -388,6 +432,7 @@ impl VcsErrorCode {
             Self::UnrecordedChanges => "unrecorded_changes",
             Self::Conflict => "conflict",
             Self::Unsupported => "unsupported",
+            Self::Redacted => "redacted",
             Self::Host => "host",
             Self::Internal => "internal",
         }
@@ -477,6 +522,10 @@ pub struct VcsObjectView {
     #[cfg_attr(feature = "ts", ts(optional = nullable))]
     pub blob: Option<VcsBlobRefView>,
     pub metadata_json: String,
+    /// The body was erased by a `Purge`: `text`, `record_json` or the blob's
+    /// bytes are gone, the rest of the view is as it was.
+    #[serde(default)]
+    pub redacted: bool,
 }
 
 #[luv_ffi]

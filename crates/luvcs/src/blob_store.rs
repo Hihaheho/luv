@@ -37,6 +37,19 @@ CREATE TABLE IF NOT EXISTS vcs_blob_chunks (
 ) STRICT;
 "#;
 
+/// Pins arrived after `PutBlob` blobs were already being stored unmarked.
+/// Created in a store that has blobs, the table starts with every one of
+/// them pinned: which were the host's cannot be told any more, and a pin
+/// only keeps a blob pushed and safe from `Gc`, as before pins existed.
+const PINS_SQL: &str = r#"
+CREATE TABLE vcs_blob_pins (
+  realm_id BLOB NOT NULL,
+  blob_id BLOB NOT NULL,
+  PRIMARY KEY (realm_id, blob_id)
+) STRICT;
+INSERT INTO vcs_blob_pins (realm_id, blob_id) SELECT realm_id, blob_id FROM vcs_blobs;
+"#;
+
 /// Local chunk size; equal to the transfer segment size so a segment is
 /// one chunk read.
 pub const CHUNK_SIZE: u64 = SEGMENT_SIZE;
@@ -71,6 +84,14 @@ pub struct BlobInfo {
 
 pub fn ensure_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(SCHEMA_SQL)?;
+    let has_pins: bool = conn.query_row(
+        "SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'vcs_blob_pins'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_pins {
+        conn.execute_batch(PINS_SQL)?;
+    }
     Ok(())
 }
 
@@ -272,6 +293,32 @@ pub fn read_verified<D: Digest + ?Sized>(
     Ok(bytes)
 }
 
+/// Marks a blob as the host's: something outside the object model (a
+/// record field, say) refers to it, so push sends it and garbage
+/// collection keeps it even though no binary state names it.
+pub fn pin(conn: &Connection, realm_id: RealmId, blob_id: BlobId) -> Result<()> {
+    ensure_schema(conn)?;
+    conn.execute(
+        "INSERT OR IGNORE INTO vcs_blob_pins (realm_id, blob_id) VALUES (?1, ?2)",
+        params![realm_id.to_vec(), blob_id.to_vec()],
+    )?;
+    Ok(())
+}
+
+/// The pinned blobs of a realm, present or not.
+pub fn pinned(conn: &Connection, realm_id: RealmId) -> Result<Vec<BlobId>> {
+    ensure_schema(conn)?;
+    let mut stmt =
+        conn.prepare("SELECT blob_id FROM vcs_blob_pins WHERE realm_id = ?1 ORDER BY blob_id")?;
+    let rows = stmt.query_map(params![realm_id.to_vec()], |r| r.get::<_, Vec<u8>>(0))?;
+    rows.map(|r| {
+        let bytes = r?;
+        BlobId::from_bytes(&bytes)
+            .map_err(|e| BlobStoreError::Corrupt(BlobId([0; 32]), e.to_string()))
+    })
+    .collect()
+}
+
 /// Removes a blob's local bytes. Holds and retention are a later stage;
 /// callers decide when a blob is unreferenced.
 pub fn delete_local(conn: &Connection, realm_id: RealmId, blob_id: BlobId) -> Result<bool> {
@@ -344,6 +391,20 @@ mod tests {
             read_verified(&conn, &d, realm().id, r1.blob_id),
             Err(BlobStoreError::NotFound(..))
         ));
+    }
+
+    #[test]
+    fn blobs_stored_before_pins_existed_are_pinned() {
+        let conn = Connection::open_in_memory().unwrap();
+        let d = RustDigest;
+        let (old, _) = put_local(&conn, &d, &realm(), b"from an older store", 1).unwrap();
+        // An older store: blob tables without the pin table.
+        conn.execute_batch("DROP TABLE vcs_blob_pins").unwrap();
+        ensure_schema(&conn).unwrap();
+        assert_eq!(pinned(&conn, realm().id).unwrap(), vec![old.blob_id]);
+        // Later blobs are not pinned for being there.
+        put_local(&conn, &d, &realm(), b"new", 2).unwrap();
+        assert_eq!(pinned(&conn, realm().id).unwrap(), vec![old.blob_id]);
     }
 
     #[test]

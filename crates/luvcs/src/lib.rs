@@ -15,6 +15,7 @@ pub mod id;
 pub mod merge;
 pub mod model;
 pub mod record;
+pub mod redaction;
 pub mod remote;
 pub mod tree;
 
@@ -38,7 +39,8 @@ uniffi::setup_scaffolding!();
 pub use digest::{Digest, DigestError, Hash32};
 pub use id::{
     BlobId, BookmarkId, BookmarkUpdateId, ChangeId, CommitId, ConflictId, ContentId, IdKey,
-    ObjectId, ObjectStateId, OperationId, RealmId, RepoId, TreeId, WorkspaceId, content_id,
+    ObjectId, ObjectStateId, OperationId, RealmId, RedactionId, RepoId, TreeId, WorkspaceId,
+    content_id,
 };
 pub use model::{
     Actor, ActorKind, BlobRef, Capabilities, Commit, Conflict, ConflictTerm, CoreError, ObjectBody,
