@@ -8,6 +8,7 @@
 //! crate brings a Rust implementation.
 
 pub mod blob;
+pub mod bookmark;
 pub mod cbor;
 pub mod digest;
 pub mod id;
@@ -36,8 +37,8 @@ uniffi::setup_scaffolding!();
 
 pub use digest::{Digest, DigestError, Hash32};
 pub use id::{
-    BlobId, ChangeId, CommitId, ConflictId, ContentId, IdKey, ObjectId, ObjectStateId, OperationId,
-    RealmId, RepoId, TreeId, WorkspaceId, content_id,
+    BlobId, BookmarkId, BookmarkUpdateId, ChangeId, CommitId, ConflictId, ContentId, IdKey,
+    ObjectId, ObjectStateId, OperationId, RealmId, RepoId, TreeId, WorkspaceId, content_id,
 };
 pub use model::{
     Actor, ActorKind, BlobRef, Capabilities, Commit, Conflict, ConflictTerm, CoreError, ObjectBody,

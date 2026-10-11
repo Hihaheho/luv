@@ -182,6 +182,14 @@ fixed_id!(
     /// Keyed ID of a stored conflict value.
     ConflictId, 32, "cfl_"
 );
+fixed_id!(
+    /// Random 128-bit ID of a bookmark; survives renames.
+    BookmarkId, 16, "bmk_"
+);
+fixed_id!(
+    /// Keyed ID of one bookmark (or repo setting) update.
+    BookmarkUpdateId, 32, "bmu_"
+);
 
 /// Domain separation for keyed IDs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,6 +199,7 @@ pub enum Domain {
     Tree,
     Commit,
     Conflict,
+    BookmarkUpdate,
 }
 
 impl Domain {
@@ -201,6 +210,7 @@ impl Domain {
             Domain::Tree => "tree",
             Domain::Commit => "commit",
             Domain::Conflict => "conflict",
+            Domain::BookmarkUpdate => "bookmark_update",
         }
     }
 }

@@ -97,7 +97,7 @@ pub enum CoreError {
 }
 
 impl CoreError {
-    fn invalid(kind: &'static str, detail: impl Into<String>) -> Self {
+    pub(crate) fn invalid(kind: &'static str, detail: impl Into<String>) -> Self {
         CoreError::Invalid {
             kind,
             detail: detail.into(),
@@ -109,13 +109,17 @@ impl CoreError {
 // Shared decoding helpers
 // ---------------------------------------------------------------------------
 
-struct Fields<'a> {
+pub(crate) struct Fields<'a> {
     kind: &'static str,
     value: &'a Value,
 }
 
 impl<'a> Fields<'a> {
-    fn new(kind: &'static str, value: &'a Value, allowed: &[&str]) -> Result<Self, CoreError> {
+    pub(crate) fn new(
+        kind: &'static str,
+        value: &'a Value,
+        allowed: &[&str],
+    ) -> Result<Self, CoreError> {
         let entries = value
             .map_entries()
             .ok_or_else(|| CoreError::invalid(kind, "not a map with text keys"))?;
@@ -127,26 +131,26 @@ impl<'a> Fields<'a> {
         Ok(Self { kind, value })
     }
 
-    fn get(&self, key: &str) -> Result<&'a Value, CoreError> {
+    pub(crate) fn get(&self, key: &str) -> Result<&'a Value, CoreError> {
         self.value
             .get(key)
             .ok_or_else(|| CoreError::invalid(self.kind, format!("missing field {key:?}")))
     }
 
-    fn u32(&self, key: &str) -> Result<u32, CoreError> {
+    pub(crate) fn u32(&self, key: &str) -> Result<u32, CoreError> {
         self.get(key)?
             .as_u64()
             .and_then(|v| u32::try_from(v).ok())
             .ok_or_else(|| CoreError::invalid(self.kind, format!("{key} is not a u32")))
     }
 
-    fn i64(&self, key: &str) -> Result<i64, CoreError> {
+    pub(crate) fn i64(&self, key: &str) -> Result<i64, CoreError> {
         self.get(key)?
             .as_i64()
             .ok_or_else(|| CoreError::invalid(self.kind, format!("{key} is not an i64")))
     }
 
-    fn text(&self, key: &str, max: usize) -> Result<String, CoreError> {
+    pub(crate) fn text(&self, key: &str, max: usize) -> Result<String, CoreError> {
         let s = self
             .get(key)?
             .as_text()
@@ -160,12 +164,16 @@ impl<'a> Fields<'a> {
         Ok(s.to_owned())
     }
 
-    fn id<T>(&self, key: &str, parse: fn(&Value) -> Option<T>) -> Result<T, CoreError> {
+    pub(crate) fn id<T>(&self, key: &str, parse: fn(&Value) -> Option<T>) -> Result<T, CoreError> {
         parse(self.get(key)?)
             .ok_or_else(|| CoreError::invalid(self.kind, format!("{key} is not a valid id")))
     }
 
-    fn ids<T>(&self, key: &str, parse: fn(&Value) -> Option<T>) -> Result<Vec<T>, CoreError> {
+    pub(crate) fn ids<T>(
+        &self,
+        key: &str,
+        parse: fn(&Value) -> Option<T>,
+    ) -> Result<Vec<T>, CoreError> {
         self.get(key)?
             .as_array()
             .ok_or_else(|| CoreError::invalid(self.kind, format!("{key} is not an array")))?
@@ -178,7 +186,7 @@ impl<'a> Fields<'a> {
             .collect()
     }
 
-    fn capabilities(&self) -> Result<Vec<String>, CoreError> {
+    pub(crate) fn capabilities(&self) -> Result<Vec<String>, CoreError> {
         let caps: Vec<String> = self
             .get("required_capabilities")?
             .as_array()
@@ -195,7 +203,7 @@ impl<'a> Fields<'a> {
     }
 }
 
-fn validate_capabilities(kind: &'static str, caps: &[String]) -> Result<(), CoreError> {
+pub(crate) fn validate_capabilities(kind: &'static str, caps: &[String]) -> Result<(), CoreError> {
     if caps.len() > MAX_CAPABILITIES {
         return Err(CoreError::invalid(kind, "too many required capabilities"));
     }
@@ -219,7 +227,7 @@ fn validate_capabilities(kind: &'static str, caps: &[String]) -> Result<(), Core
     Ok(())
 }
 
-fn check_support(
+pub(crate) fn check_support(
     kind: &'static str,
     format: u32,
     known_format: u32,
@@ -237,7 +245,7 @@ fn check_support(
     Ok(())
 }
 
-fn caps_value(caps: &[String]) -> Value {
+pub(crate) fn caps_value(caps: &[String]) -> Value {
     Value::Array(caps.iter().map(|c| Value::text(c.clone())).collect())
 }
 
@@ -532,7 +540,7 @@ pub struct Actor {
 }
 
 impl Actor {
-    fn to_cbor(&self) -> Value {
+    pub(crate) fn to_cbor(&self) -> Value {
         Value::map([
             ("kind", Value::text(self.kind.as_str())),
             ("device_id", Value::text(self.device_id.clone())),
@@ -540,7 +548,7 @@ impl Actor {
         ])
     }
 
-    fn from_cbor(value: &Value) -> Result<Self, CoreError> {
+    pub(crate) fn from_cbor(value: &Value) -> Result<Self, CoreError> {
         const KIND: &str = "commit.author";
         let f = Fields::new(KIND, value, &["kind", "device_id", "description"])?;
         let kind = f.text("kind", 16)?;
