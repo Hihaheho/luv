@@ -18,6 +18,7 @@ const REPO: RepoId = RepoId([1; 16]);
 const WS: WorkspaceId = WorkspaceId([2; 16]);
 const NOTE: ObjectId = ObjectId([0x10; 16]);
 const OTHER: ObjectId = ObjectId([0x20; 16]);
+const MAIN: luvcs::id::BookmarkId = luvcs::id::BookmarkId([0xA1; 16]);
 
 fn key() -> IdKey {
     IdKey([7; 32])
@@ -628,7 +629,8 @@ fn export_import_round_trips_and_verifies_ids() {
         let c = repo
             .record(&ctx.next(WS, None), RecordSource::Working, "c")
             .unwrap();
-        repo.set_ref("main", c).unwrap();
+        repo.create_bookmark(&ctx.next(WS, None), MAIN, "main", c)
+            .unwrap();
         repo.export_archive().unwrap()
     };
 
@@ -640,7 +642,11 @@ fn export_import_round_trips_and_verifies_ids() {
     assert!(n >= 4);
     let visible = repo.visible().unwrap();
     assert_eq!(visible.len(), 1);
-    assert_eq!(repo.refs().unwrap()["main"], visible[0]);
+    // Bookmarks travel as objects.
+    assert_eq!(
+        repo.bookmark(MAIN).unwrap().target,
+        luvcs::bookmark::Field::Value(visible[0])
+    );
     let snap = repo.snapshot(visible[0]).unwrap();
     assert_eq!(snap.len(), 1);
     // Importing twice is idempotent.

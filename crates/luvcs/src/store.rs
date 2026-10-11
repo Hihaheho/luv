@@ -267,12 +267,6 @@ CREATE TABLE IF NOT EXISTS vcs_rewrites (
   to_commit BLOB NOT NULL,
   PRIMARY KEY (repo_id, operation_id, from_commit, to_commit)
 ) STRICT;
-CREATE TABLE IF NOT EXISTS vcs_refs (
-  repo_id BLOB NOT NULL,
-  name TEXT NOT NULL,
-  commit_id BLOB NOT NULL,
-  PRIMARY KEY (repo_id, name)
-) STRICT;
 CREATE TABLE IF NOT EXISTS vcs_bookmark_updates (
   repo_id BLOB NOT NULL,
   update_id BLOB NOT NULL,
@@ -481,12 +475,8 @@ impl<'c, D: Digest> Repo<'_, 'c, D> {
 
     /// Makes a replicated commit a head: it joins the visible set and every
     /// visible ancestor of it leaves; a commit that is already an ancestor
-    /// of a head changes nothing. Refs named by the publisher are set.
-    pub fn merge_visible(
-        &mut self,
-        commit_id: CommitId,
-        refs: &[(String, CommitId)],
-    ) -> Result<()> {
+    /// of a head changes nothing.
+    pub fn merge_visible(&mut self, commit_id: CommitId) -> Result<()> {
         self.commit(commit_id)?;
         self.tree_entries(self.commit(commit_id)?.root)?;
         let tx = self.store.conn.unchecked_transaction()?;
@@ -506,14 +496,6 @@ impl<'c, D: Digest> Repo<'_, 'c, D> {
             tx.execute(
                 "INSERT OR IGNORE INTO vcs_visible (repo_id, commit_id) VALUES (?1, ?2)",
                 params![self.repo_id.as_bytes(), commit_id.to_vec()],
-            )?;
-        }
-        for (name, id) in refs {
-            self.commit(*id)?;
-            tx.execute(
-                "INSERT INTO vcs_refs (repo_id, name, commit_id) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (repo_id, name) DO UPDATE SET commit_id = excluded.commit_id",
-                params![self.repo_id.as_bytes(), name, id.to_vec()],
             )?;
         }
         tx.commit()?;
@@ -816,24 +798,6 @@ impl<D: Digest> Repo<'_, '_, D> {
     /// Commits with no visible descendant: the repo's current heads.
     pub fn visible(&self) -> Result<Vec<CommitId>> {
         Ok(self.reader().visible()?.into_iter().collect())
-    }
-
-    pub fn refs(&self) -> Result<BTreeMap<String, CommitId>> {
-        let mut stmt = self
-            .store
-            .conn
-            .prepare("SELECT name, commit_id FROM vcs_refs WHERE repo_id = ?1 ORDER BY name")?;
-        let rows = stmt.query_map(params![self.repo_id.as_bytes()], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, Vec<u8>>(1)?))
-        })?;
-        rows.map(|r| {
-            let (name, id) = r?;
-            Ok((
-                name,
-                CommitId::from_bytes(&id).map_err(|e| StoreError::Invalid(e.to_string()))?,
-            ))
-        })
-        .collect()
     }
 
     /// All commits sharing a change ID, oldest first: the rewrite history
@@ -1249,18 +1213,6 @@ impl<D: Digest> Repo<'_, '_, D> {
         })
     }
 
-    pub fn set_ref(&mut self, name: &str, commit: CommitId) -> Result<()> {
-        if !self.has_commit(commit)? {
-            return Err(StoreError::UnknownCommit(commit));
-        }
-        self.store.conn.execute(
-            "INSERT INTO vcs_refs (repo_id, name, commit_id) VALUES (?1, ?2, ?3)
-             ON CONFLICT (repo_id, name) DO UPDATE SET commit_id = excluded.commit_id",
-            params![self.repo_id.as_bytes(), name, commit.to_vec()],
-        )?;
-        Ok(())
-    }
-
     /// Integrates `other` into the workspace: three-way merge of the base
     /// snapshot and `other`'s snapshot against their common ancestor. The
     /// result is a merge commit with parents `[base, other]`; objects that
@@ -1502,6 +1454,9 @@ impl<D: Digest> Repo<'_, '_, D> {
             author,
             now_unix_ms,
         )?;
+        // The log entry now names the updates the redo wrote, so a later
+        // undo compensates for those. This is the one place an entry's
+        // `after` changes after it is written.
         tx.execute(
             "UPDATE vcs_operations SET undone = 0, after = ?2 WHERE seq = ?1",
             params![seq, after],
@@ -1594,8 +1549,9 @@ impl<D: Digest> Repo<'_, '_, D> {
 
     // ----- export / import ----------------------------------------------------
 
-    /// Exports every immutable object plus visible set and refs as one
-    /// canonical CBOR archive (same realm, same IDs). Workspaces and the operation log are local and not exported.
+    /// Exports every immutable object (bookmark updates included) plus the
+    /// visible set as one canonical CBOR archive (same realm, same IDs).
+    /// Workspaces and the operation log are local and not exported.
     pub fn export_archive(&self) -> Result<Vec<u8>> {
         let mut stmt = self.store.conn.prepare(
             "SELECT kind, logical_id, bytes FROM vcs_objects WHERE repo_id = ?1 ORDER BY kind, logical_id",
@@ -1617,7 +1573,6 @@ impl<D: Digest> Repo<'_, '_, D> {
             ]));
         }
         let visible = self.visible()?;
-        let refs = self.refs()?;
         // Local blobs of the repo's realm travel with the archive so binary
         // objects stay readable on the importing device.
         let realm = crate::blob_store::repo_realm(self.repo_id, &self.key);
@@ -1645,10 +1600,6 @@ impl<D: Digest> Repo<'_, '_, D> {
             (
                 "visible",
                 Value::Array(visible.iter().map(CommitId::to_cbor).collect()),
-            ),
-            (
-                "refs",
-                Value::map(refs.iter().map(|(k, v)| (k.clone(), v.to_cbor()))),
             ),
         ])))
     }
@@ -1720,17 +1671,6 @@ impl<D: Digest> Repo<'_, '_, D> {
                         id: format!("blob:{claimed}"),
                     });
                 }
-            }
-        }
-        if let Some(refs) = v.get("refs").and_then(Value::map_entries) {
-            for (name, id) in refs {
-                let id = CommitId::from_cbor(id).ok_or_else(|| bad("bad ref id"))?;
-                reader.commit(id, &self.store.caps)?;
-                tx.execute(
-                    "INSERT INTO vcs_refs (repo_id, name, commit_id) VALUES (?1, ?2, ?3)
-                     ON CONFLICT (repo_id, name) DO UPDATE SET commit_id = excluded.commit_id",
-                    params![self.repo_id.as_bytes(), name, id.to_vec()],
-                )?;
             }
         }
         tx.commit()?;

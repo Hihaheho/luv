@@ -118,13 +118,6 @@ pub struct WireObject {
     pub bytes_base64: String,
 }
 
-/// A named reference to a commit.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WireRef {
-    pub name: String,
-    pub commit_id: String,
-}
-
 /// What a client appends to the log.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -143,12 +136,11 @@ pub enum EntryBody {
         repo_id: String,
         objects: Vec<WireObject>,
     },
-    /// The announcer's heads and refs. Every commit named here is in an
-    /// earlier entry of the log.
+    /// The announcer's heads. Every commit named here is in an earlier
+    /// entry of the log. (Bookmarks travel as `bookmark_update` objects.)
     Heads {
         repo_id: String,
         commit_ids: Vec<String>,
-        refs: Vec<WireRef>,
     },
     /// The bytes of a blob are in the blob store (all chunks).
     Blob {
@@ -289,10 +281,6 @@ mod tests {
                 EntryBody::Heads {
                     repo_id: "repo_a".into(),
                     commit_ids: vec!["cmt_x".into()],
-                    refs: vec![WireRef {
-                        name: "main".into(),
-                        commit_id: "cmt_x".into(),
-                    }],
                 },
             ],
         };

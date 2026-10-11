@@ -2,7 +2,8 @@
 //!
 //! The remote is an ordered log (see `luvcs-protocol`). **Push** appends
 //! what the remote has not seen: the repo's creation, its immutable
-//! objects, its blobs and the device's current heads and refs. **Pull**
+//! objects (bookmark updates among them), its blobs and the device's
+//! current heads. **Pull**
 //! reads the entries after the device's cursor and takes them in:
 //! objects are re-hashed under the repo's ID key before they are stored,
 //! heads are folded into the device's visible set the same way a local
@@ -19,7 +20,7 @@
 //! cursor and what it is known to hold); use a stable string per remote.
 
 use base64::Engine as _;
-use luvcs_protocol::{EntryBody, MAX_READ_ENTRIES, WireObject, WireRef};
+use luvcs_protocol::{EntryBody, MAX_READ_ENTRIES, WireObject};
 use rusqlite::{Connection, OptionalExtension as _, params};
 
 use crate::api::{HostContext, LocalRepo, VcsError, ensure_local_schema, insert_local_repo};
@@ -282,10 +283,9 @@ pub fn push(
     }
     report.blobs = uploaded.len();
 
-    // 4. The device's heads and refs, when they changed.
+    // 4. The device's heads, when they changed.
     let visible = repo.visible()?;
-    let refs = repo.refs()?;
-    let announcement = announcement_text(&visible, &refs);
+    let announcement = announcement_text(&visible);
     let last: Option<String> = conn
         .query_row(
             "SELECT announced FROM vcs_sync_heads WHERE remote = ?1 AND repo_id = ?2",
@@ -293,18 +293,10 @@ pub fn push(
             |r| r.get(0),
         )
         .optional()?;
-    let has_heads = !(visible.is_empty() && refs.is_empty());
-    if has_heads && last.as_deref() != Some(announcement.as_str()) {
+    if !visible.is_empty() && last.as_deref() != Some(announcement.as_str()) {
         bodies.push(EntryBody::Heads {
             repo_id: rid_text.clone(),
             commit_ids: visible.iter().map(ToString::to_string).collect(),
-            refs: refs
-                .iter()
-                .map(|(name, id)| WireRef {
-                    name: name.clone(),
-                    commit_id: id.to_string(),
-                })
-                .collect(),
         });
         report.heads_announced = true;
     }
@@ -348,15 +340,11 @@ pub fn push(
     Ok(report)
 }
 
-/// A canonical text of the heads and refs, to tell whether they changed.
-fn announcement_text(
-    visible: &[CommitId],
-    refs: &std::collections::BTreeMap<String, CommitId>,
-) -> String {
+/// A canonical text of the heads, to tell whether they changed.
+fn announcement_text(visible: &[CommitId]) -> String {
     let mut heads: Vec<String> = visible.iter().map(ToString::to_string).collect();
     heads.sort();
-    let refs: Vec<String> = refs.iter().map(|(n, c)| format!("{n}={c}")).collect();
-    format!("{}|{}", heads.join(","), refs.join(","))
+    heads.join(",")
 }
 
 // ---------------------------------------------------------------------------
@@ -529,19 +517,13 @@ fn apply(
         EntryBody::Heads {
             repo_id,
             commit_ids,
-            refs,
         } => {
             let repo_id = parse_repo(repo_id)?;
             let local = local_repo(conn, repo_id)?;
-            let mut named = Vec::with_capacity(refs.len());
-            for r in refs {
-                named.push((r.name.clone(), parse_commit(&r.commit_id)?));
-            }
             let mut store = Store::open(conn, host.digest)?;
             let mut repo = store.repo(repo_id, local.key)?;
-            for (i, commit) in commit_ids.iter().enumerate() {
-                let commit = parse_commit(commit)?;
-                repo.merge_visible(commit, if i == 0 { &named } else { &[] })?;
+            for commit in commit_ids {
+                repo.merge_visible(parse_commit(commit)?)?;
             }
         }
         EntryBody::Blob {

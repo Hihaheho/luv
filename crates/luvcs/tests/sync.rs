@@ -573,80 +573,53 @@ fn zero_remote_limits_are_protocol_errors() {
     assert_eq!(remote.head().unwrap(), 0);
 }
 
-/// Opens the store side of `repo` on `device` (bookmarks have no request
-/// API yet).
-fn with_store<R>(
-    device: &Device,
-    repo: &str,
-    f: impl FnOnce(&mut luvcs::store::Repo<'_, '_, RustDigest>, luvcs::id::WorkspaceId) -> R,
-) -> R {
-    use luvcs::id::{IdKey, RepoId, WorkspaceId};
-    let (key, ws): (Vec<u8>, Vec<u8>) = device
-        .conn
-        .query_row(
-            "SELECT id_key, workspace_id FROM vcs_local_repos WHERE repo_id = ?1",
-            [RepoId::parse(repo).unwrap().to_vec()],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
-    let mut store = luvcs::store::Store::open(&device.conn, RustDigest).unwrap();
-    let mut r = store
-        .repo(RepoId::parse(repo).unwrap(), IdKey(key.try_into().unwrap()))
-        .unwrap();
-    f(&mut r, WorkspaceId::from_bytes(&ws).unwrap())
-}
-
-fn op(ws: luvcs::id::WorkspaceId, n: u8) -> luvcs::store::OperationContext {
-    luvcs::store::OperationContext {
-        operation_id: luvcs::id::OperationId([n; 16]),
-        workspace_id: ws,
-        expected_token: None,
-        actor: luvcs::model::Actor {
-            kind: ActorKind::User,
-            device_id: format!("dev-{n}"),
-            description: String::new(),
-        },
-        reason: String::new(),
-        now_unix_ms: i64::from(n),
-    }
-}
-
 #[test]
 fn bookmarks_travel_and_concurrent_moves_conflict_the_same_everywhere() {
-    use luvcs::bookmark::Field;
-    use luvcs::id::{BookmarkId, CommitId};
-    use luvcs::store::BookmarkEdit;
-    let main = BookmarkId([0xB0; 16]);
+    use luvcs::api::VcsBookmarks;
+    let list = |device: &Device, repo: &str| -> VcsBookmarks {
+        match device.run(VcsRequest::ListBookmarks {
+            repo_id: repo.into(),
+        }) {
+            VcsResponse::Bookmarks { bookmarks } => bookmarks,
+            other => panic!("{other:?}"),
+        }
+    };
     let remote = MemoryRemote::new();
     let a = Device::new(0);
     let repo = a.create("notes");
     let object = a.save_text(&repo, None, "1\n");
-    let c1: CommitId = a.record(&repo, "1").parse().unwrap();
-    with_store(&a, &repo, |r, ws| {
-        r.create_bookmark(&op(ws, 0xA0), main, "main", c1).unwrap();
-    });
+    let c1 = a.record(&repo, "1");
+    let main = match a.run(VcsRequest::CreateBookmark {
+        repo_id: repo.clone(),
+        name: "main".into(),
+        commit_id: c1.clone(),
+    }) {
+        VcsResponse::Bookmark { bookmark } => bookmark,
+        other => panic!("{other:?}"),
+    };
     a.push(&remote, &repo);
 
     let b = Device::new(100);
     b.pull(&remote);
-    let created = with_store(&b, &repo, |r, _| {
-        let state = r.bookmark(main).unwrap();
-        assert_eq!(state.name, Field::Value("main".to_owned()));
-        assert_eq!(state.target, Field::Value(c1));
-        state.heads
-    });
+    let on_b = list(&b, &repo).bookmarks;
+    assert_eq!(on_b.len(), 1);
+    assert_eq!(on_b[0].name.as_deref(), Some("main"));
+    assert_eq!(on_b[0].target_commit_id.as_deref(), Some(c1.as_str()));
+    assert_eq!(on_b[0].token, main.token);
 
     // Each device commits and moves the bookmark to its own commit.
     let mut moved = Vec::new();
-    for (device, text, n) in [(&a, "a\n", 0xA1), (&b, "b\n", 0xB1)] {
+    for (device, text) in [(&a, "a\n"), (&b, "b\n")] {
         device.save_text(&repo, Some(&object), text);
-        let c: CommitId = device.record(&repo, text).parse().unwrap();
-        with_store(device, &repo, |r, ws| {
-            let edit = BookmarkEdit {
-                target: Some(c),
-                ..BookmarkEdit::default()
-            };
-            r.edit_bookmark(&op(ws, n), main, &created, edit).unwrap();
+        let c = device.record(&repo, text);
+        device.run(VcsRequest::EditBookmark {
+            repo_id: repo.clone(),
+            bookmark_id: main.bookmark_id.clone(),
+            token: main.token.clone(),
+            name: None,
+            commit_id: Some(c.clone()),
+            life: None,
+            new_default: None,
         });
         moved.push(c);
     }
@@ -654,16 +627,12 @@ fn bookmarks_travel_and_concurrent_moves_conflict_the_same_everywhere() {
     b.push(&remote, &repo);
     a.pull(&remote);
     b.pull(&remote);
-    let on_a = with_store(&a, &repo, |r, _| r.bookmark(main).unwrap());
-    let on_b = with_store(&b, &repo, |r, _| r.bookmark(main).unwrap());
+    let on_a = list(&a, &repo).bookmarks;
+    let on_b = list(&b, &repo).bookmarks;
     assert_eq!(on_a, on_b);
-    match on_a.target {
-        Field::Conflict(c) => {
-            let mut values: Vec<CommitId> = c.iter().map(|c| c.value).collect();
-            values.sort();
-            moved.sort();
-            assert_eq!(values, moved);
-        }
-        other => panic!("{other:?}"),
-    }
+    assert_eq!(on_a[0].target_commit_id, None);
+    let mut candidates = on_a[0].target_candidates.clone();
+    candidates.sort();
+    moved.sort();
+    assert_eq!(candidates, moved);
 }

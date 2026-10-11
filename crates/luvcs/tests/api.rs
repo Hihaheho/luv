@@ -1058,3 +1058,187 @@ fn resolving_a_content_conflict_keeps_the_agreed_title() {
         other => panic!("{other:?}"),
     }
 }
+
+#[test]
+fn bookmarks_through_the_request_api() {
+    use luvcs::api::{VcsAdvance, VcsBookmarkLife, VcsBookmarkLifeKind, VcsNewDefault};
+    let conn = Connection::open_in_memory().unwrap();
+    let host = host();
+    let repo = create(&conn, &host);
+    let save = |text: &str| {
+        run(
+            &conn,
+            &host,
+            VcsRequest::SaveText {
+                repo_id: repo.clone(),
+                object_id: None,
+                type_id: "note".into(),
+                text: text.into(),
+                title: Some(format!("{text}.md")),
+            },
+        );
+    };
+    let list = || match run(
+        &conn,
+        &host,
+        VcsRequest::ListBookmarks {
+            repo_id: repo.clone(),
+        },
+    ) {
+        VcsResponse::Bookmarks { bookmarks } => bookmarks,
+        other => panic!("{other:?}"),
+    };
+    save("one");
+    let c1 = match run(
+        &conn,
+        &host,
+        VcsRequest::Record {
+            repo_id: repo.clone(),
+            description: "one".into(),
+            objects: None,
+        },
+    ) {
+        VcsResponse::Commit { commit } => commit.commit_id,
+        other => panic!("{other:?}"),
+    };
+    let main = match run(
+        &conn,
+        &host,
+        VcsRequest::CreateBookmark {
+            repo_id: repo.clone(),
+            name: "main".into(),
+            commit_id: c1.clone(),
+        },
+    ) {
+        VcsResponse::Bookmark { bookmark } => bookmark,
+        other => panic!("{other:?}"),
+    };
+    assert_eq!(main.name.as_deref(), Some("main"));
+    assert_eq!(main.target_commit_id.as_deref(), Some(c1.as_str()));
+    assert_eq!(main.life.as_ref().unwrap().kind, VcsBookmarkLifeKind::Live);
+    assert!(!main.is_selected && !main.is_default);
+
+    run(
+        &conn,
+        &host,
+        VcsRequest::SelectBookmark {
+            repo_id: repo.clone(),
+            bookmark_id: Some(main.bookmark_id.clone()),
+        },
+    );
+    let record_advancing = |text: &str, token: &str| {
+        save(text);
+        match run(
+            &conn,
+            &host,
+            VcsRequest::RecordAdvancing {
+                repo_id: repo.clone(),
+                description: text.into(),
+                objects: None,
+                token: token.into(),
+            },
+        ) {
+            VcsResponse::Recorded { commit, advance } => (commit.commit_id, advance),
+            other => panic!("{other:?}"),
+        }
+    };
+    let (c2, advance) = record_advancing("two", &main.token);
+    assert_eq!(advance, VcsAdvance::Advanced);
+    let listed = list();
+    assert_eq!(
+        listed.selected_bookmark_id.as_ref(),
+        Some(&main.bookmark_id)
+    );
+    let now = &listed.bookmarks[0];
+    assert!(now.is_selected);
+    assert_eq!(now.target_commit_id.as_deref(), Some(c2.as_str()));
+    // The old token is stale now: the commit is recorded, the bookmark stays.
+    let (_, advance) = record_advancing("three", &main.token);
+    assert_eq!(advance, VcsAdvance::Stale);
+    assert_eq!(
+        list().bookmarks[0].target_commit_id.as_deref(),
+        Some(c2.as_str())
+    );
+
+    let listed = run(
+        &conn,
+        &host,
+        VcsRequest::SetDefaultBookmark {
+            repo_id: repo.clone(),
+            token: list().default_token,
+            bookmark_id: Some(main.bookmark_id.clone()),
+        },
+    );
+    let VcsResponse::Bookmarks { bookmarks: listed } = listed else {
+        panic!("{listed:?}")
+    };
+    assert!(listed.bookmarks[0].is_default);
+    assert_eq!(listed.default_bookmark_id.as_ref(), Some(&main.bookmark_id));
+
+    let delete = |new_default: Option<VcsNewDefault>| {
+        execute(
+            &conn,
+            &host.ctx(),
+            VcsRequest::EditBookmark {
+                repo_id: repo.clone(),
+                bookmark_id: main.bookmark_id.clone(),
+                token: list().bookmarks[0].token.clone(),
+                name: None,
+                commit_id: None,
+                life: Some(VcsBookmarkLife {
+                    kind: VcsBookmarkLifeKind::Deleted,
+                    fused_into: None,
+                }),
+                new_default,
+            },
+        )
+    };
+    match delete(None) {
+        VcsResponse::Error { error } => assert_eq!(error.code, VcsErrorCode::Invalid),
+        other => panic!("{other:?}"),
+    }
+    match delete(Some(VcsNewDefault::Unset)) {
+        VcsResponse::Bookmark { bookmark } => {
+            assert_eq!(bookmark.life.unwrap().kind, VcsBookmarkLifeKind::Deleted);
+            assert!(!bookmark.is_default);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(list().default_bookmark_id, None);
+
+    // Undo brings back both the bookmark and the default.
+    run(
+        &conn,
+        &host,
+        VcsRequest::Undo {
+            repo_id: repo.clone(),
+        },
+    );
+    let listed = list();
+    assert_eq!(
+        listed.bookmarks[0].life.as_ref().unwrap().kind,
+        VcsBookmarkLifeKind::Live
+    );
+    assert!(listed.bookmarks[0].is_default);
+
+    // A fused life needs the bookmark it fused into, and nothing else does.
+    match execute(
+        &conn,
+        &host.ctx(),
+        VcsRequest::EditBookmark {
+            repo_id: repo.clone(),
+            bookmark_id: main.bookmark_id.clone(),
+            token: listed.bookmarks[0].token.clone(),
+            name: None,
+            commit_id: None,
+            life: Some(VcsBookmarkLife {
+                kind: VcsBookmarkLifeKind::Fused,
+                fused_into: None,
+            }),
+            new_default: None,
+        },
+    ) {
+        VcsResponse::Error { error } => assert_eq!(error.code, VcsErrorCode::Invalid),
+        other => panic!("{other:?}"),
+    }
+}

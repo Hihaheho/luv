@@ -154,6 +154,67 @@ pub enum VcsRequest {
         repo_id: String,
         limit: u32,
     },
+    /// Every bookmark (deleted and fused ones included), the repo default
+    /// and the workspace's selection.
+    ListBookmarks {
+        repo_id: String,
+    },
+    CreateBookmark {
+        repo_id: String,
+        name: String,
+        commit_id: String,
+    },
+    /// Changes a bookmark the caller listed with `token`: moves it
+    /// (`commit_id`), renames it (`name`), or sets its `life` (delete,
+    /// fuse into another, revive). Resolving a conflict is the same edit:
+    /// give the chosen value for the field in conflict. `new_default`
+    /// changes the repo default in the same operation, and is needed to
+    /// delete the default bookmark.
+    EditBookmark {
+        repo_id: String,
+        bookmark_id: String,
+        token: String,
+        #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
+        name: Option<String>,
+        #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
+        commit_id: Option<String>,
+        #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
+        life: Option<VcsBookmarkLife>,
+        #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
+        new_default: Option<VcsNewDefault>,
+    },
+    /// Sets the repo default (none when `bookmark_id` is omitted); `token`
+    /// is the listing's `default_token`.
+    SetDefaultBookmark {
+        repo_id: String,
+        token: String,
+        #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
+        bookmark_id: Option<String>,
+    },
+    /// Selects the bookmark records here move forward (none when omitted).
+    /// Local to this device.
+    SelectBookmark {
+        repo_id: String,
+        #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
+        bookmark_id: Option<String>,
+    },
+    /// Records like `Record`, then moves the selected bookmark to the new
+    /// commit if it is still as listed with `token` and the commit descends
+    /// from where it points. The commit is recorded either way.
+    RecordAdvancing {
+        repo_id: String,
+        description: String,
+        #[serde(default)]
+        #[cfg_attr(feature = "ts", ts(optional = nullable))]
+        objects: Option<Vec<String>>,
+        token: String,
+    },
     Export {
         repo_id: String,
     },
@@ -229,6 +290,16 @@ pub enum VcsResponse {
     },
     Operations {
         operations: Vec<VcsOperationView>,
+    },
+    Bookmarks {
+        bookmarks: VcsBookmarks,
+    },
+    Bookmark {
+        bookmark: VcsBookmarkView,
+    },
+    Recorded {
+        commit: VcsCommitView,
+        advance: VcsAdvance,
     },
     /// An exported repo. `id_key_base64` is the repo's secret ID key: keep
     /// the archive as private as the content itself.
@@ -452,4 +523,92 @@ pub struct VcsOperationView {
     pub reason: String,
     pub created_at_unix_ms: i64,
     pub undone: bool,
+}
+
+/// Whether a bookmark exists; serialized as snake_case.
+#[luv_ffi]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum VcsBookmarkLifeKind {
+    Live,
+    Deleted,
+    /// Merged into the bookmark `fused_into`, which carries on for it.
+    Fused,
+}
+
+#[luv_ffi]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VcsBookmarkLife {
+    pub kind: VcsBookmarkLifeKind,
+    /// Set exactly when `kind` is `fused`.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub fused_into: Option<String>,
+}
+
+/// The repo default to set alongside a bookmark edit.
+#[luv_ffi]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum VcsNewDefault {
+    Bookmark { bookmark_id: String },
+    Unset,
+}
+
+/// One bookmark. A field in conflict is `None`, with its candidates in the
+/// matching `*_candidates` list (empty otherwise). Nothing here picks a
+/// candidate; the host shows them and an `EditBookmark` settles them.
+#[luv_ffi]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VcsBookmarkView {
+    pub bookmark_id: String,
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub name: Option<String>,
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub target_commit_id: Option<String>,
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub life: Option<VcsBookmarkLife>,
+    pub name_candidates: Vec<String>,
+    pub target_candidates: Vec<String>,
+    pub life_candidates: Vec<VcsBookmarkLife>,
+    /// Another bookmark that is not deleted or fused goes by the same name,
+    /// so the name alone does not pick this one.
+    pub name_shared: bool,
+    /// The repo default, after following fused bookmarks.
+    pub is_default: bool,
+    /// Selected in this device's workspace.
+    pub is_selected: bool,
+    /// Opaque; what the caller saw. Pass it back to change this bookmark.
+    pub token: String,
+}
+
+#[luv_ffi]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VcsBookmarks {
+    pub bookmarks: Vec<VcsBookmarkView>,
+    /// The default as set, which may name a deleted or fused bookmark;
+    /// `None` when unset or in conflict.
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub default_bookmark_id: Option<String>,
+    /// When the default is in conflict: every candidate (`None` = unset).
+    pub default_candidates: Vec<Option<String>>,
+    /// Opaque; pass it to `SetDefaultBookmark`.
+    pub default_token: String,
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub selected_bookmark_id: Option<String>,
+}
+
+/// What `RecordAdvancing` did to the selected bookmark.
+#[luv_ffi]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum VcsAdvance {
+    Advanced,
+    NoSelection,
+    /// The bookmark changed since the token was read.
+    Stale,
+    /// Its life or target is in conflict, or it is deleted or fused.
+    Unresolved,
+    /// The new commit does not descend from where it points.
+    NotForward,
 }

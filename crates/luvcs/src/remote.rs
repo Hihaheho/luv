@@ -347,7 +347,6 @@ mod tests {
         EntryBody::Heads {
             repo_id: "repo_a".into(),
             commit_ids: vec![format!("cmt_{n}")],
-            refs: vec![],
         }
     }
 
@@ -516,7 +515,7 @@ mod tests {
         let remote = MemoryRemote::new();
         let input = [
             r#"{"type":"hello","protocol":1,"client":"test"}"#,
-            r#"{"type":"append","entries":[{"type":"heads","repo_id":"repo_a","commit_ids":["cmt_1"],"refs":[]}]}"#,
+            r#"{"type":"append","entries":[{"type":"heads","repo_id":"repo_a","commit_ids":["cmt_1"]}]}"#,
             r#"{"type":"read","after":0,"limit":10}"#,
             r#"{"type":"hello","protocol":99,"client":"test"}"#,
             "not json",

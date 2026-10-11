@@ -15,15 +15,18 @@ use rusqlite::{Connection, params};
 
 pub use crate::api_types::*;
 use crate::blob_store;
+use crate::bookmark::{Field, Life, SubjectState};
 use crate::cbor::Value;
 use crate::digest::{Digest, DigestError};
 use crate::id::{
-    BlobId, CommitId, IdKey, ObjectId, ObjectStateId, OperationId, RealmId, RepoId, WorkspaceId,
+    BlobId, BookmarkId, BookmarkUpdateId, CommitId, IdKey, ObjectId, ObjectStateId, OperationId,
+    RealmId, RepoId, WorkspaceId,
 };
 use crate::model::{Actor, ActorKind, BlobRef, ObjectBody, ObjectState, TermKind};
 use crate::record::{Element, RecordValue};
 use crate::store::{
-    OperationContext, RecordSource, Repo, SchemaRegistry, Store, StoreError, Workspace,
+    Advance, BookmarkEdit, BookmarkEntry, OperationContext, RecordSource, Repo, SchemaRegistry,
+    Store, StoreError, Workspace,
 };
 
 /// What a host provides for one call.
@@ -361,6 +364,95 @@ fn metadata(title: Option<&str>) -> Value {
     }
 }
 
+/// A bookmark token: the heads it was read at, as text the host passes back.
+fn token_of(heads: &[BookmarkUpdateId]) -> String {
+    heads
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn parse_token(token: &str) -> ApiResult<Vec<BookmarkUpdateId>> {
+    token
+        .split(',')
+        .filter(|t| !t.is_empty())
+        .map(|t| parse("bookmark token", t))
+        .collect()
+}
+
+fn life_view(life: Life) -> VcsBookmarkLife {
+    let (kind, fused_into) = match life {
+        Life::Live => (VcsBookmarkLifeKind::Live, None),
+        Life::Deleted => (VcsBookmarkLifeKind::Deleted, None),
+        Life::FusedInto(b) => (VcsBookmarkLifeKind::Fused, Some(b.to_string())),
+    };
+    VcsBookmarkLife { kind, fused_into }
+}
+
+fn parse_life(life: &VcsBookmarkLife) -> ApiResult<Life> {
+    match (life.kind, &life.fused_into) {
+        (VcsBookmarkLifeKind::Live, None) => Ok(Life::Live),
+        (VcsBookmarkLifeKind::Deleted, None) => Ok(Life::Deleted),
+        (VcsBookmarkLifeKind::Fused, Some(b)) => Ok(Life::FusedInto(parse("bookmark id", b)?)),
+        _ => Err(VcsError::invalid(
+            "fused_into is given exactly when the life is fused",
+        )),
+    }
+}
+
+fn advance_view(advance: Advance) -> VcsAdvance {
+    match advance {
+        Advance::Advanced(_) => VcsAdvance::Advanced,
+        Advance::NoSelection => VcsAdvance::NoSelection,
+        Advance::Stale => VcsAdvance::Stale,
+        Advance::Unresolved => VcsAdvance::Unresolved,
+        Advance::NotForward => VcsAdvance::NotForward,
+    }
+}
+
+/// The default bookmark after following fused bookmarks to a live one;
+/// `None` when unset, in conflict, deleted, or the chain does not end.
+fn effective_default(settings: &SubjectState, entries: &[BookmarkEntry]) -> Option<BookmarkId> {
+    let mut at = settings.default_bookmark.value().copied().flatten()?;
+    for _ in 0..=entries.len() {
+        let entry = entries.iter().find(|e| e.id == at)?;
+        match entry.state.life {
+            Field::Value(Life::Live) => return Some(at),
+            Field::Value(Life::FusedInto(next)) => at = next,
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn bookmark_entry_view(
+    entry: &BookmarkEntry,
+    default: Option<BookmarkId>,
+    selected: Option<BookmarkId>,
+) -> VcsBookmarkView {
+    fn candidates<T, U>(field: &Field<T>, f: impl Fn(&T) -> U) -> Vec<U> {
+        match field {
+            Field::Conflict(c) => c.iter().map(|c| f(&c.value)).collect(),
+            _ => Vec::new(),
+        }
+    }
+    let s = &entry.state;
+    VcsBookmarkView {
+        bookmark_id: entry.id.to_string(),
+        name: s.name.value().cloned(),
+        target_commit_id: s.target.value().map(ToString::to_string),
+        life: s.life.value().copied().map(life_view),
+        name_candidates: candidates(&s.name, String::clone),
+        target_candidates: candidates(&s.target, ToString::to_string),
+        life_candidates: candidates(&s.life, |l| life_view(*l)),
+        name_shared: entry.name_shared,
+        is_default: default == Some(entry.id),
+        is_selected: selected == Some(entry.id),
+        token: token_of(&s.heads),
+    }
+}
+
 fn title_of(state: &ObjectState) -> Option<String> {
     state
         .metadata
@@ -385,6 +477,56 @@ struct Session<'r, 's, 'c, D: Digest> {
 }
 
 impl<D: Digest> Session<'_, '_, '_, D> {
+    /// Where a record takes its snapshot from: the working tree, or only
+    /// `objects` of it (frozen as the candidate first).
+    fn record_source(&mut self, objects: Option<Vec<String>>) -> ApiResult<RecordSource> {
+        let Some(ids) = objects else {
+            return Ok(RecordSource::Working);
+        };
+        let ids = ids
+            .iter()
+            .map(|s| parse::<ObjectId>("object id", s))
+            .collect::<ApiResult<Vec<_>>>()?;
+        let ctx = self.ctx_with_reason("select")?;
+        self.repo.select_candidate(&ctx, &ids)?;
+        Ok(RecordSource::Candidate)
+    }
+
+    fn bookmarks_view(&mut self) -> ApiResult<VcsBookmarks> {
+        let selected = self.workspace()?.selected_bookmark;
+        let entries = self.repo.bookmarks()?;
+        let settings = self.repo.repo_settings()?;
+        let effective = effective_default(&settings, &entries);
+        let bookmarks = entries
+            .iter()
+            .map(|e| bookmark_entry_view(e, effective, selected))
+            .collect();
+        Ok(VcsBookmarks {
+            bookmarks,
+            default_bookmark_id: settings
+                .default_bookmark
+                .value()
+                .copied()
+                .flatten()
+                .map(|b| b.to_string()),
+            default_candidates: match &settings.default_bookmark {
+                Field::Conflict(c) => c.iter().map(|c| c.value.map(|b| b.to_string())).collect(),
+                _ => Vec::new(),
+            },
+            default_token: token_of(&settings.heads),
+            selected_bookmark_id: selected.map(|b| b.to_string()),
+        })
+    }
+
+    fn bookmark_view(&mut self, id: BookmarkId) -> ApiResult<VcsBookmarkView> {
+        let wanted = id.to_string();
+        self.bookmarks_view()?
+            .bookmarks
+            .into_iter()
+            .find(|b| b.bookmark_id == wanted)
+            .ok_or_else(|| StoreError::UnknownBookmark(id).into())
+    }
+
     fn ctx(&self) -> ApiResult<OperationContext> {
         Ok(OperationContext {
             operation_id: OperationId(self.host.random_16()?),
@@ -868,18 +1010,7 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                 ..
             } => {
                 self.workspace()?;
-                let source = match objects {
-                    Some(ids) => {
-                        let ids = ids
-                            .iter()
-                            .map(|s| parse::<ObjectId>("object id", s))
-                            .collect::<ApiResult<Vec<_>>>()?;
-                        let ctx = self.ctx_with_reason("select")?;
-                        self.repo.select_candidate(&ctx, &ids)?;
-                        RecordSource::Candidate
-                    }
-                    None => RecordSource::Working,
-                };
+                let source = self.record_source(objects)?;
                 let ctx = self.ctx_with_reason(&description)?;
                 let id = self.repo.record(&ctx, source, &description)?;
                 let heads = self.repo.visible()?;
@@ -1079,6 +1210,94 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                     .map(operation_view)
                     .collect(),
             },
+            VcsRequest::ListBookmarks { .. } => VcsResponse::Bookmarks {
+                bookmarks: self.bookmarks_view()?,
+            },
+            VcsRequest::CreateBookmark {
+                name, commit_id, ..
+            } => {
+                self.workspace()?;
+                let id = BookmarkId(self.host.random_16()?);
+                let ctx = self.ctx_with_reason("bookmark create")?;
+                self.repo
+                    .create_bookmark(&ctx, id, &name, parse("commit id", &commit_id)?)?;
+                VcsResponse::Bookmark {
+                    bookmark: self.bookmark_view(id)?,
+                }
+            }
+            VcsRequest::EditBookmark {
+                bookmark_id,
+                token,
+                name,
+                commit_id,
+                life,
+                new_default,
+                ..
+            } => {
+                self.workspace()?;
+                let id: BookmarkId = parse("bookmark id", &bookmark_id)?;
+                let edit = BookmarkEdit {
+                    life: life.as_ref().map(parse_life).transpose()?,
+                    name,
+                    target: commit_id.map(|c| parse("commit id", &c)).transpose()?,
+                    new_default: new_default
+                        .map(|d| match d {
+                            VcsNewDefault::Bookmark { bookmark_id } => {
+                                parse("bookmark id", &bookmark_id).map(Some)
+                            }
+                            VcsNewDefault::Unset => Ok(None),
+                        })
+                        .transpose()?,
+                };
+                let ctx = self.ctx_with_reason("bookmark edit")?;
+                self.repo
+                    .edit_bookmark(&ctx, id, &parse_token(&token)?, edit)?;
+                VcsResponse::Bookmark {
+                    bookmark: self.bookmark_view(id)?,
+                }
+            }
+            VcsRequest::SetDefaultBookmark {
+                token, bookmark_id, ..
+            } => {
+                self.workspace()?;
+                let default = bookmark_id.map(|b| parse("bookmark id", &b)).transpose()?;
+                let ctx = self.ctx_with_reason("bookmark default")?;
+                self.repo
+                    .set_default_bookmark(&ctx, &parse_token(&token)?, default)?;
+                VcsResponse::Bookmarks {
+                    bookmarks: self.bookmarks_view()?,
+                }
+            }
+            VcsRequest::SelectBookmark { bookmark_id, .. } => {
+                self.workspace()?;
+                let selected = bookmark_id.map(|b| parse("bookmark id", &b)).transpose()?;
+                let ctx = self.ctx_with_reason("bookmark select")?;
+                self.repo.select_bookmark(&ctx, selected)?;
+                VcsResponse::Bookmarks {
+                    bookmarks: self.bookmarks_view()?,
+                }
+            }
+            VcsRequest::RecordAdvancing {
+                description,
+                objects,
+                token,
+                ..
+            } => {
+                self.workspace()?;
+                let source = self.record_source(objects)?;
+                let ctx = self.ctx_with_reason(&description)?;
+                let (id, advance) = self.repo.record_advancing(
+                    &ctx,
+                    source,
+                    &description,
+                    &parse_token(&token)?,
+                )?;
+                let heads = self.repo.visible()?;
+                VcsResponse::Recorded {
+                    commit: self.commit_view(id, &heads)?,
+                    advance: advance_view(advance),
+                }
+            }
             VcsRequest::Export { .. } => {
                 let bytes = self.repo.export_archive()?;
                 let working = self.workspace()?.working;
@@ -1130,6 +1349,12 @@ fn repo_id_of(request: &VcsRequest) -> Option<&str> {
         | VcsRequest::Show { repo_id, .. }
         | VcsRequest::Heads { repo_id }
         | VcsRequest::Operations { repo_id, .. }
+        | VcsRequest::ListBookmarks { repo_id }
+        | VcsRequest::CreateBookmark { repo_id, .. }
+        | VcsRequest::EditBookmark { repo_id, .. }
+        | VcsRequest::SetDefaultBookmark { repo_id, .. }
+        | VcsRequest::SelectBookmark { repo_id, .. }
+        | VcsRequest::RecordAdvancing { repo_id, .. }
         | VcsRequest::Export { repo_id } => Some(repo_id),
     }
 }

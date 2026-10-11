@@ -34,11 +34,17 @@ A conflict is not written into the file as markers. It is recorded as a `Conflic
 
 Every operation runs in one SQLite transaction, so a crash leaves either all of it or nothing. There is an operation log, and undo / redo work on it.
 
-A commit can have several parents. There are no branch names or bookmarks, and several heads can exist side by side.
+A commit can have several parents, and several heads can exist side by side.
+
+### Bookmarks
+
+A bookmark is a name pointing at a commit. There is no checked-out branch: a workspace may select a bookmark, and a record there moves it forward only when the caller saw its latest state and the new commit descends from where it points. A bookmark has its own ID, so renaming it keeps it the same bookmark.
+
+A bookmark's history is a DAG of immutable updates that travel like commits. Its state is computed from the set of updates alone, never from arrival order: per field (name, target, existence), the latest updates decide. A rename and a move made on two devices both land; two different moves, a delete against an edit, or two renames are kept as conflicts with every candidate, until someone chooses. Two moves that both went forward along one line of history agree on the furthest. Two devices can each make a bookmark of the same name; luv reports the shared name instead of picking one, and either can be renamed, deleted, or fused into the other. Undo of a bookmark change writes a new update rather than erasing one that may already be shared. The repo's default bookmark is kept the same way.
 
 ### IDs are keyed hashes
 
-Content IDs (content / state / tree / commit / conflict / blob) are HMAC-SHA256 under a per-repo key, over canonical CBOR, so the same value always encodes to the same bytes. A snapshot is a Patricia tree keyed by object ID. It has the same root regardless of insertion order, and commits share the subtrees that did not change.
+Content IDs (content / state / tree / commit / conflict / blob / bookmark update) are HMAC-SHA256 under a per-repo key, over canonical CBOR, so the same value always encodes to the same bytes. A snapshot is a Patricia tree keyed by object ID. It has the same root regardless of insertion order, and commits share the subtrees that did not change.
 
 The same content has different IDs in different repos. Blob deduplication also stays inside one repo.
 
@@ -50,7 +56,7 @@ The core crate takes hashing, randomness, the clock and the device ID from the h
 
 - It is not git compatible. It cannot read a git repository and does not speak git's commands.
 - It is not a service and has no server of its own. Devices exchange history through a remote: an append-only log plus a blob store, which is a shared directory or a program that speaks the messages of `luvcs-protocol`. The store is a SQLite file under `.luv/` in the work tree. A repo can also be exported and imported.
-- It has no branches. There are no named references.
+- It has no checked-out branch. Bookmarks name commits, but nothing moves them behind your back: a pull never moves a bookmark onto your working tree, and a record moves only the bookmark you selected.
 - It does not take "every file in the directory". The CLI only sees files that match a glob in `Luv.eure`. A file that matches nothing is never saved, listed or deleted.
 - It is not only a line merger. Structured values are merged as structures. It does not, on the other hand, understand the meaning of text or the syntax of code when it merges.
 - It is not an encryption or access control tool. A repo's ID key is stored in the store in plain form, and the store file is readable only by its owner. The remote's log carries that key too, so that a device that pulls can verify what it takes in; the remote has to be kept as private as the content, and encrypting it is the remote's job. An exported archive needs the same care.
@@ -80,7 +86,7 @@ include = ["**/*.md"]
 
 `remote set` writes `.luv/remote.eure`, next to the store. `Luv.eure`, the file that is meant to travel with the files, never names a command, and `.luv`, `.git` and `.jj` are never tracked or restored at any depth, so files that come from someone else's history cannot change the remote or make `luv` run a command. `push` sends what the remote has not seen and never conflicts. `pull` takes the remote's history in and leaves your files alone. A remote is trusted like a secret: the first time a repo arrives from a remote, luv accepts the ID key that remote gives it, so pull only from remotes you trust. A second device starts with `remote set`, `pull`, then `init --repo <name>`, which attaches to the repo that was pulled, and `restore`.
 
-Undo / redo, integrate and conflict resolution exist in the request API but not yet in the CLI. After concurrent commits a repo has several heads and `luv log` shows them all; merging them from the CLI is not there yet. Symbolic links are not tracked; luv prints a warning and skips them.
+Undo / redo, integrate, conflict resolution and bookmarks exist in the request API but not yet in the CLI. After concurrent commits a repo has several heads and `luv log` shows them all; merging them from the CLI is not there yet. Symbolic links are not tracked; luv prints a warning and skips them.
 
 ## Layout
 
