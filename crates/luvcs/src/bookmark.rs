@@ -589,12 +589,6 @@ mod tests {
     const B: BookmarkId = BookmarkId([2; 16]);
     const OTHER: BookmarkId = BookmarkId([3; 16]);
 
-    /// A reader that knows bookmarks (`v1()` does not claim them until
-    /// the store keeps and syncs them).
-    fn caps() -> Capabilities {
-        Capabilities::v1().with(BOOKMARK_CAPABILITY_V1)
-    }
-
     fn c(n: u8) -> CommitId {
         CommitId([n; 32])
     }
@@ -638,7 +632,10 @@ mod tests {
                 self.clock,
             );
             let bytes = u.encode().unwrap();
-            assert_eq!(BookmarkUpdate::decode(&bytes, &caps()).unwrap(), u);
+            assert_eq!(
+                BookmarkUpdate::decode(&bytes, &Capabilities::v1()).unwrap(),
+                u
+            );
             let id = u.id(&RustDigest, &IdKey([9; 32])).unwrap();
             self.updates.insert(id, u);
             id
@@ -953,7 +950,7 @@ mod tests {
         let ok = update(Subject::Bookmark(B), some_pred, rename("x"));
         let bytes = ok.encode().unwrap();
         assert!(matches!(
-            BookmarkUpdate::decode(&bytes, &Capabilities::v1()),
+            BookmarkUpdate::decode(&bytes, &Capabilities::default().with("core.v1")),
             Err(CoreError::Unsupported { .. })
         ));
     }

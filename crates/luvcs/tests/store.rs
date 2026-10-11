@@ -35,6 +35,14 @@ fn store(conn: &Connection) -> Store<'_, RustDigest> {
     s
 }
 
+fn actor() -> Actor {
+    Actor {
+        kind: ActorKind::User,
+        device_id: "test".into(),
+        description: String::new(),
+    }
+}
+
 struct Ctx {
     n: u64,
 }
@@ -52,11 +60,7 @@ impl Ctx {
             operation_id: OperationId(id),
             workspace_id: ws,
             expected_token,
-            actor: Actor {
-                kind: ActorKind::User,
-                device_id: "test".into(),
-                description: String::new(),
-            },
+            actor: actor(),
             reason: format!("op {}", self.n),
             now_unix_ms: 1_000 + self.n as i64,
         }
@@ -241,7 +245,7 @@ fn undo_and_redo_move_the_workspace_and_visible_set_without_deleting_commits() {
         .unwrap();
     assert_eq!(repo.visible().unwrap(), vec![c2]);
 
-    let undone = repo.undo().unwrap();
+    let undone = repo.undo(&actor(), 0).unwrap();
     assert_eq!(undone.kind, "record");
     assert_eq!(repo.visible().unwrap(), vec![c1]);
     let ws = repo.workspace(WS).unwrap();
@@ -252,29 +256,35 @@ fn undo_and_redo_move_the_workspace_and_visible_set_without_deleting_commits() {
     );
     assert!(repo.has_commit(c2).unwrap());
 
-    repo.undo().unwrap(); // save_working of s2
+    repo.undo(&actor(), 0).unwrap(); // save_working of s2
     assert_eq!(
         repo.working_entries(WS).unwrap(),
         BTreeMap::from([(NOTE, s1)])
     );
 
-    repo.redo().unwrap();
+    repo.redo(&actor(), 0).unwrap();
     assert_eq!(
         repo.working_entries(WS).unwrap(),
         BTreeMap::from([(NOTE, s2)])
     );
-    repo.redo().unwrap();
+    repo.redo(&actor(), 0).unwrap();
     assert_eq!(repo.visible().unwrap(), vec![c2]);
-    assert!(matches!(repo.redo(), Err(StoreError::NothingToRedo)));
+    assert!(matches!(
+        repo.redo(&actor(), 0),
+        Err(StoreError::NothingToRedo)
+    ));
 
     // A new operation after an undo discards the undone branch.
-    repo.undo().unwrap();
+    repo.undo(&actor(), 0).unwrap();
     let s3 = repo
         .put_text_state(NOTE, "note", b"3", Value::Map(vec![]))
         .unwrap();
     repo.save_working(&ctx.next(WS, None), &[(NOTE, Some(s3))])
         .unwrap();
-    assert!(matches!(repo.redo(), Err(StoreError::NothingToRedo)));
+    assert!(matches!(
+        repo.redo(&actor(), 0),
+        Err(StoreError::NothingToRedo)
+    ));
     let ops = repo.operations(10).unwrap();
     assert!(ops.iter().all(|o| !o.undone));
 }

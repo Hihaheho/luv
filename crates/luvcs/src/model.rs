@@ -47,6 +47,7 @@ impl Capabilities {
                 "merge.text.v1",
                 "merge.record.v1",
                 "merge.object.v1",
+                "bookmark.v1",
             ]
             .into_iter()
             .map(str::to_owned)

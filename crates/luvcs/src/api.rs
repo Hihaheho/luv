@@ -80,11 +80,12 @@ impl From<StoreError> for VcsError {
             | StoreError::UnknownWorkspace(_)
             | StoreError::UnknownCommit(_)
             | StoreError::MissingObject { .. }
-            | StoreError::UnknownBinding(_) => VcsErrorCode::NotFound,
-            StoreError::StaleToken { .. } => VcsErrorCode::Stale,
-            StoreError::RepoExists(_) | StoreError::IdentityConflict { .. } => {
-                VcsErrorCode::Conflict
-            }
+            | StoreError::UnknownBinding(_)
+            | StoreError::UnknownBookmark(_) => VcsErrorCode::NotFound,
+            StoreError::StaleToken { .. } | StoreError::StaleBookmark => VcsErrorCode::Stale,
+            StoreError::RepoExists(_)
+            | StoreError::IdentityConflict { .. }
+            | StoreError::NameTaken(_) => VcsErrorCode::Conflict,
             StoreError::NothingToRecord => VcsErrorCode::NothingToRecord,
             StoreError::UnrecordedChanges => VcsErrorCode::UnrecordedChanges,
             StoreError::Core(crate::model::CoreError::Unsupported { .. }) => {
@@ -100,7 +101,8 @@ impl From<StoreError> for VcsError {
             | StoreError::NothingToUndo
             | StoreError::NothingToRedo
             | StoreError::UnknownSchema(_)
-            | StoreError::DuplicateOperation(_) => VcsErrorCode::Invalid,
+            | StoreError::DuplicateOperation(_)
+            | StoreError::BookmarkIsDefault(_) => VcsErrorCode::Invalid,
         };
         Self::new(code, e.to_string())
     }
@@ -895,13 +897,15 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                 }
             }
             VcsRequest::Undo { .. } => {
-                let op = self.repo.undo()?;
+                let ctx = self.ctx_with_reason("undo")?;
+                let op = self.repo.undo(&ctx.actor, ctx.now_unix_ms)?;
                 VcsResponse::Operation {
                     operation: operation_view(&op),
                 }
             }
             VcsRequest::Redo { .. } => {
-                let op = self.repo.redo()?;
+                let ctx = self.ctx_with_reason("redo")?;
+                let op = self.repo.redo(&ctx.actor, ctx.now_unix_ms)?;
                 VcsResponse::Operation {
                     operation: operation_view(&op),
                 }

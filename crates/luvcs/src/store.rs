@@ -11,11 +11,12 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
+use crate::bookmark::BookmarkUpdate;
 use crate::cbor::{self, Value};
 use crate::digest::{Digest, DigestError};
 use crate::id::{
-    BlobId, ChangeId, CommitId, ConflictId, ContentId, IdKey, ObjectId, ObjectStateId, OperationId,
-    RepoId, TreeId, WorkspaceId, content_id,
+    BlobId, BookmarkId, BookmarkUpdateId, ChangeId, CommitId, ConflictId, ContentId, IdKey,
+    ObjectId, ObjectStateId, OperationId, RepoId, TreeId, WorkspaceId, content_id,
 };
 use crate::merge::{self, RECORD_DRIVER_V1, TEXT_DRIVER_V1};
 use crate::model::{
@@ -24,6 +25,9 @@ use crate::model::{
 };
 use crate::record::{RecordSchema, RecordValue};
 use crate::tree::{self, Node, TreeError};
+
+mod bookmarks;
+pub use bookmarks::{Advance, BookmarkEdit, BookmarkEntry};
 
 pub const STORE_SCHEMA_VERSION: u32 = 1;
 
@@ -71,6 +75,14 @@ pub enum StoreError {
     DuplicateOperation(OperationId),
     #[error("binding {0} is not adopted by this database")]
     UnknownBinding(String),
+    #[error("bookmark {0} is not in this repo")]
+    UnknownBookmark(BookmarkId),
+    #[error("the bookmark heads changed since they were read")]
+    StaleBookmark,
+    #[error("another bookmark is named {0:?}")]
+    NameTaken(String),
+    #[error("bookmark {0} is the default; give a new default to delete it")]
+    BookmarkIsDefault(BookmarkId),
     #[error("{0}")]
     Invalid(String),
 }
@@ -99,6 +111,8 @@ pub struct Workspace {
     pub base: Option<CommitId>,
     pub working: TreeId,
     pub candidate: Option<TreeId>,
+    /// The bookmark a record here moves forward, if any.
+    pub selected_bookmark: Option<BookmarkId>,
     pub token: u64,
 }
 
@@ -114,6 +128,12 @@ impl Workspace {
             (
                 "candidate",
                 self.candidate.as_ref().map_or(Value::Null, TreeId::to_cbor),
+            ),
+            (
+                "selected_bookmark",
+                self.selected_bookmark
+                    .as_ref()
+                    .map_or(Value::Null, BookmarkId::to_cbor),
             ),
             ("token", Value::Uint(self.token)),
         ])
@@ -137,6 +157,11 @@ impl Workspace {
             candidate: match v.get("candidate") {
                 Some(Value::Null) | None => None,
                 Some(x) => Some(TreeId::from_cbor(x).ok_or_else(bad)?),
+            },
+            // Absent in snapshots written before bookmarks.
+            selected_bookmark: match v.get("selected_bookmark") {
+                Some(Value::Null) | None => None,
+                Some(x) => Some(BookmarkId::from_cbor(x).ok_or_else(bad)?),
             },
             token: v.get("token").and_then(Value::as_u64).ok_or_else(bad)?,
         })
@@ -248,6 +273,13 @@ CREATE TABLE IF NOT EXISTS vcs_refs (
   commit_id BLOB NOT NULL,
   PRIMARY KEY (repo_id, name)
 ) STRICT;
+CREATE TABLE IF NOT EXISTS vcs_bookmark_updates (
+  repo_id BLOB NOT NULL,
+  update_id BLOB NOT NULL,
+  subject BLOB NOT NULL,
+  PRIMARY KEY (repo_id, update_id)
+) STRICT;
+CREATE INDEX IF NOT EXISTS vcs_bookmark_updates_subject ON vcs_bookmark_updates (repo_id, subject);
 CREATE TABLE IF NOT EXISTS vcs_workspaces (
   repo_id BLOB NOT NULL,
   workspace_id BLOB NOT NULL,
@@ -428,19 +460,7 @@ impl<'c, D: Digest> Repo<'_, 'c, D> {
 
     /// Whether `ancestor` is `commit` itself or reachable through parents.
     pub fn is_ancestor(&self, ancestor: CommitId, commit: CommitId) -> Result<bool> {
-        let reader = self.reader();
-        let mut seen = BTreeSet::new();
-        let mut stack = vec![commit];
-        while let Some(c) = stack.pop() {
-            if c == ancestor {
-                return Ok(true);
-            }
-            if !seen.insert(c) {
-                continue;
-            }
-            stack.extend(reader.parents(c)?);
-        }
-        Ok(false)
+        self.reader().is_ancestor(ancestor, commit)
     }
 
     /// Imports verified immutable objects `(kind, logical id, bytes)` that
@@ -530,6 +550,7 @@ pub fn has_commit_object(
     )
 }
 const KIND_CONFLICT: &str = "conflict";
+const KIND_BOOKMARK_UPDATE: &str = "bookmark_update";
 
 /// Read side shared by `Repo` and the in-transaction executor.
 struct Reader<'a> {
@@ -608,6 +629,22 @@ impl Reader<'_> {
         let rows = stmt.query_map(params![self.repo], |r| r.get::<_, Vec<u8>>(0))?;
         rows.map(|r| CommitId::from_bytes(&r?).map_err(|e| StoreError::Invalid(e.to_string())))
             .collect()
+    }
+
+    /// Whether `ancestor` is `commit` itself or reachable through parents.
+    fn is_ancestor(&self, ancestor: CommitId, commit: CommitId) -> Result<bool> {
+        let mut seen = BTreeSet::new();
+        let mut stack = vec![commit];
+        while let Some(c) = stack.pop() {
+            if c == ancestor {
+                return Ok(true);
+            }
+            if !seen.insert(c) {
+                continue;
+            }
+            stack.extend(self.parents(c)?);
+        }
+        Ok(false)
     }
 
     fn parents(&self, id: CommitId) -> Result<Vec<CommitId>> {
@@ -911,6 +948,7 @@ impl<D: Digest> Repo<'_, '_, D> {
             base,
             working,
             candidate: None,
+            selected_bookmark: None,
             token: 1,
         };
         let n = self.store.conn.execute(
@@ -977,6 +1015,7 @@ impl<D: Digest> Repo<'_, '_, D> {
             visible_added: Vec::new(),
             visible_removed: Vec::new(),
             rewrites: Vec::new(),
+            bookmark_writes: Vec::new(),
         };
         let (mut after, result) = f(&mut exec, &before)?;
         after.token = before.token + 1;
@@ -986,10 +1025,14 @@ impl<D: Digest> Repo<'_, '_, D> {
             visible_added,
             visible_removed,
             rewrites,
+            bookmark_writes,
             ..
         } = exec;
         for (ordinal, (kind_, id, bytes)) in pending.objects.iter().enumerate() {
             Self::put_object_tx(&tx, repo.as_bytes(), kind_, id, bytes)?;
+            if *kind_ == KIND_BOOKMARK_UPDATE {
+                bookmarks::index_tx(&tx, repo, id, bytes, &caps)?;
+            }
             tx.execute(
                 "INSERT INTO vcs_operation_objects (repo_id, operation_id, ordinal, kind, logical_id) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![repo.as_bytes(), ctx.operation_id.to_vec(), ordinal as i64, kind_, id],
@@ -1021,7 +1064,10 @@ impl<D: Digest> Repo<'_, '_, D> {
                 cbor::encode(&after.to_cbor())
             ],
         )?;
-        let log = |ws: &Workspace, added: &[CommitId], removed: &[CommitId]| {
+        let log = |ws: &Workspace,
+                   added: &[CommitId],
+                   removed: &[CommitId],
+                   bookmark_writes: &[BookmarkUpdateId]| {
             cbor::encode(&Value::map([
                 ("workspace", ws.to_cbor()),
                 (
@@ -1031,6 +1077,15 @@ impl<D: Digest> Repo<'_, '_, D> {
                 (
                     "visible_removed",
                     Value::Array(removed.iter().map(CommitId::to_cbor).collect()),
+                ),
+                (
+                    "bookmark_writes",
+                    Value::Array(
+                        bookmark_writes
+                            .iter()
+                            .map(BookmarkUpdateId::to_cbor)
+                            .collect(),
+                    ),
                 ),
             ]))
         };
@@ -1049,8 +1104,8 @@ impl<D: Digest> Repo<'_, '_, D> {
                 kind,
                 ctx.reason,
                 ctx.now_unix_ms,
-                log(&before, &[], &[]),
-                log(&after, &visible_added, &visible_removed),
+                log(&before, &[], &[], &[]),
+                log(&after, &visible_added, &visible_removed, &bookmark_writes),
             ],
         )?;
         tx.commit()?;
@@ -1142,33 +1197,26 @@ impl<D: Digest> Repo<'_, '_, D> {
         description: &str,
     ) -> Result<CommitId> {
         self.operate(ctx, "record", |exec, ws| {
-            let root = match source {
-                RecordSource::Working => ws.working,
-                RecordSource::Candidate => ws.candidate.ok_or(StoreError::NoCandidate)?,
-            };
-            if let Some(base) = ws.base
-                && exec.commit(base)?.root == root
-            {
-                return Err(StoreError::NothingToRecord);
-            }
-            let commit = exec.new_commit(
-                ChangeId(exec.fresh_id(ctx, "record")?),
-                ws.base.into_iter().collect(),
-                root,
-                ctx,
-                description,
-            )?;
-            let id = exec.put_commit(&commit)?;
-            if let Some(base) = ws.base {
-                exec.hide(base);
-            }
-            exec.show(id);
-            let mut after = ws.clone();
-            after.base = Some(id);
-            if source == RecordSource::Candidate {
-                after.candidate = None;
-            }
-            Ok((after, id))
+            exec.record_commit(ctx, ws, source, description)
+        })
+    }
+
+    /// Records like [`Repo::record`], then moves the workspace's selected
+    /// bookmark forward to the new commit when its heads are still
+    /// `expected` and the new commit descends from where it points. The
+    /// commit is recorded either way; [`Advance`] tells what happened to
+    /// the bookmark.
+    pub fn record_advancing(
+        &mut self,
+        ctx: &OperationContext,
+        source: RecordSource,
+        description: &str,
+        expected: &[BookmarkUpdateId],
+    ) -> Result<(CommitId, Advance)> {
+        self.operate(ctx, "record", |exec, ws| {
+            let (after, id) = exec.record_commit(ctx, ws, source, description)?;
+            let advance = exec.advance_selected(ctx, ws.selected_bookmark, id, expected)?;
+            Ok((after, (id, advance)))
         })
     }
 
@@ -1194,6 +1242,7 @@ impl<D: Digest> Repo<'_, '_, D> {
             exec.hide(base);
             exec.show(id);
             exec.rewrites.push((base, id));
+            exec.follow_rewrite(ctx, base, id)?;
             let mut after = ws.clone();
             after.base = Some(id);
             Ok((after, id))
@@ -1366,7 +1415,9 @@ impl<D: Digest> Repo<'_, '_, D> {
 
     /// Undoes the newest applied operation on this repo. Commits stay
     /// stored; only the workspace position and the visible set move back.
-    pub fn undo(&mut self) -> Result<OperationEntry> {
+    /// Bookmark updates may already be shared, so they are not removed:
+    /// new updates by `author` put the fields back instead.
+    pub fn undo(&mut self, author: &Actor, now_unix_ms: i64) -> Result<OperationEntry> {
         let repo = self.repo_id;
         let tx = self.store.conn.unchecked_transaction()?;
         let row: Option<OpRow> = tx
@@ -1390,6 +1441,16 @@ impl<D: Digest> Repo<'_, '_, D> {
         let (seq, op_id, kind, reason, created, before, after) =
             row.ok_or(StoreError::NothingToUndo)?;
         Self::apply_log(&tx, repo, &after, &before, true)?;
+        bookmarks::undo_writes_tx(
+            &tx,
+            repo,
+            &self.key,
+            &self.store.digest,
+            &self.store.caps,
+            &after,
+            author,
+            now_unix_ms,
+        )?;
         tx.execute(
             "UPDATE vcs_operations SET undone = 1 WHERE seq = ?1",
             params![seq],
@@ -1405,8 +1466,9 @@ impl<D: Digest> Repo<'_, '_, D> {
         })
     }
 
-    /// Re-applies the oldest undone operation.
-    pub fn redo(&mut self) -> Result<OperationEntry> {
+    /// Re-applies the oldest undone operation. Its bookmark updates are
+    /// written again by `author`, as new updates.
+    pub fn redo(&mut self, author: &Actor, now_unix_ms: i64) -> Result<OperationEntry> {
         let repo = self.repo_id;
         let tx = self.store.conn.unchecked_transaction()?;
         let row: Option<OpRow> = tx
@@ -1430,9 +1492,19 @@ impl<D: Digest> Repo<'_, '_, D> {
         let (seq, op_id, kind, reason, created, _before, after) =
             row.ok_or(StoreError::NothingToRedo)?;
         Self::apply_log(&tx, repo, &after, &after, false)?;
+        let after = bookmarks::redo_writes_tx(
+            &tx,
+            repo,
+            &self.key,
+            &self.store.digest,
+            &self.store.caps,
+            &after,
+            author,
+            now_unix_ms,
+        )?;
         tx.execute(
-            "UPDATE vcs_operations SET undone = 0 WHERE seq = ?1",
-            params![seq],
+            "UPDATE vcs_operations SET undone = 0, after = ?2 WHERE seq = ?1",
+            params![seq, after],
         )?;
         tx.commit()?;
         Ok(OperationEntry {
@@ -1688,6 +1760,13 @@ impl<D: Digest> Repo<'_, '_, D> {
                 KIND_CONFLICT => Conflict::decode(data, &self.store.caps)?
                     .id(&self.store.digest, &self.key)?
                     .to_vec(),
+                KIND_BOOKMARK_UPDATE => {
+                    let u = BookmarkUpdate::decode(data, &self.store.caps)?;
+                    if u.repo_id != self.repo_id {
+                        return Err(bad("bookmark update of another repo"));
+                    }
+                    u.id(&self.store.digest, &self.key)?.to_vec()
+                }
                 _ => return Err(bad("unknown object kind")),
             };
             if expected != id {
@@ -1700,9 +1779,13 @@ impl<D: Digest> Repo<'_, '_, D> {
                 KIND_STATE => KIND_STATE,
                 KIND_TREE => KIND_TREE,
                 KIND_COMMIT => KIND_COMMIT,
+                KIND_BOOKMARK_UPDATE => KIND_BOOKMARK_UPDATE,
                 _ => KIND_CONFLICT,
             };
             Self::put_object_tx(tx, self.repo_id.as_bytes(), kind_static, id, data)?;
+            if kind == KIND_BOOKMARK_UPDATE {
+                bookmarks::index_tx(tx, self.repo_id, id, data, &self.store.caps)?;
+            }
             if kind == KIND_COMMIT {
                 let c = Commit::decode(data, &self.store.caps)?;
                 Executor::<D>::index_commit_tx(
@@ -1736,9 +1819,49 @@ struct Executor<'t, 'c, D: Digest> {
     visible_added: Vec<CommitId>,
     visible_removed: Vec<CommitId>,
     rewrites: Vec<(CommitId, CommitId)>,
+    /// Bookmark updates written, in order; undo compensates for them.
+    bookmark_writes: Vec<BookmarkUpdateId>,
 }
 
 impl<D: Digest> Executor<'_, '_, D> {
+    /// The commit of a record from the working tree or the candidate, and
+    /// the workspace moved onto it.
+    fn record_commit(
+        &mut self,
+        ctx: &OperationContext,
+        ws: &Workspace,
+        source: RecordSource,
+        description: &str,
+    ) -> Result<(Workspace, CommitId)> {
+        let root = match source {
+            RecordSource::Working => ws.working,
+            RecordSource::Candidate => ws.candidate.ok_or(StoreError::NoCandidate)?,
+        };
+        if let Some(base) = ws.base
+            && self.commit(base)?.root == root
+        {
+            return Err(StoreError::NothingToRecord);
+        }
+        let commit = self.new_commit(
+            ChangeId(self.fresh_id(ctx, "record")?),
+            ws.base.into_iter().collect(),
+            root,
+            ctx,
+            description,
+        )?;
+        let id = self.put_commit(&commit)?;
+        if let Some(base) = ws.base {
+            self.hide(base);
+        }
+        self.show(id);
+        let mut after = ws.clone();
+        after.base = Some(id);
+        if source == RecordSource::Candidate {
+            after.candidate = None;
+        }
+        Ok((after, id))
+    }
+
     fn reader(&self) -> Reader<'_> {
         Reader {
             conn: self.tx,
