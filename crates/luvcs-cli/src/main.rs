@@ -9,6 +9,7 @@
 //! restore) stay in `luvcs`, this module only maps files to objects and
 //! back.
 
+mod bookmark;
 mod local;
 mod remote_config;
 
@@ -106,16 +107,20 @@ pub enum LuvCommands {
         /// Only these paths; the rest stays uncommitted
         paths: Vec<String>,
     },
-    /// List commits, newest first
+    /// List commits, newest first, with the bookmarks on them
     Log {
         /// Maximum number of commits
         #[arg(short = 'n', long, default_value_t = DEFAULT_LOG_LIMIT)]
         limit: u32,
+        /// Only the history of this commit or bookmark
+        #[arg(long)]
+        from: Option<String>,
     },
     /// Write files back to disk as saved (discarding edits on disk), or as
     /// they were in a commit
     Restore {
-        /// Take the files from this commit (cmt_…) instead of the last commit
+        /// Take the files from this commit (cmt_… or a bookmark) instead of
+        /// the last commit
         #[arg(long)]
         commit: Option<String>,
         /// Only these paths (default: every tracked file)
@@ -125,8 +130,14 @@ pub enum LuvCommands {
     /// are written to disk; a file in conflict gets markers around each
     /// conflicting region until `luv resolve`
     Merge {
-        /// The commit to merge, e.g. a head `luv log` lists
+        /// The commit to merge (cmt_… or a bookmark), e.g. a head `luv log`
+        /// lists
         commit: String,
+    },
+    /// Names for commits: create, move, select the one commits move forward
+    Bookmark {
+        #[command(subcommand)]
+        command: bookmark::BookmarkCommands,
     },
     /// Settle a file in conflict: by default with the file as it is on disk
     Resolve {
@@ -218,9 +229,10 @@ fn run(cwd: &Path, args: LuvArgs) -> anyhow::Result<()> {
         LuvCommands::Status => ctx.status(),
         LuvCommands::Diff { paths } => ctx.diff(&paths),
         LuvCommands::Commit { message, paths } => ctx.commit(&message, &paths),
-        LuvCommands::Log { limit } => ctx.log(limit),
+        LuvCommands::Log { limit, from } => ctx.log(limit, from),
         LuvCommands::Restore { commit, paths } => ctx.restore(commit, &paths),
         LuvCommands::Merge { commit } => ctx.merge(&commit),
+        LuvCommands::Bookmark { command } => ctx.bookmark(command),
         LuvCommands::Resolve { path, take, title } => ctx.resolve(&path, take, title),
         LuvCommands::Undo => ctx.undo(true),
         LuvCommands::Redo => ctx.undo(false),
@@ -730,6 +742,7 @@ impl Ctx<'_> {
     }
 
     fn merge(&self, commit: &str) -> anyhow::Result<()> {
+        let commit = &self.rev(commit)?;
         self.ensure_clean("merge")?;
         let before = self.saved()?;
         let VcsResponse::Integrated {
@@ -874,17 +887,34 @@ impl Ctx<'_> {
         // With paths, record only those objects; without, the whole working
         // tree (which includes anything saved outside the allowlist).
         let objects = (!paths.is_empty()).then_some(selected);
-        let VcsResponse::Commit { commit } = self.call(VcsRequest::Record {
-            repo_id: self.repo_id.clone(),
-            description: message.to_owned(),
-            objects,
-        })?
-        else {
-            anyhow::bail!("unexpected response to commit");
+        // A selected bookmark moves forward with the commit, if it is still
+        // as just listed.
+        let advancing = self.selected_bookmark()?;
+        let (commit, advance) = match &advancing {
+            Some((_, token)) => match self.call(VcsRequest::RecordAdvancing {
+                repo_id: self.repo_id.clone(),
+                description: message.to_owned(),
+                objects,
+                token: token.clone(),
+            })? {
+                VcsResponse::Recorded { commit, advance } => (commit, Some(advance)),
+                other => anyhow::bail!("unexpected response to commit: {other:?}"),
+            },
+            None => match self.call(VcsRequest::Record {
+                repo_id: self.repo_id.clone(),
+                description: message.to_owned(),
+                objects,
+            })? {
+                VcsResponse::Commit { commit } => (commit, None),
+                other => anyhow::bail!("unexpected response to commit: {other:?}"),
+            },
         };
         println!("[{}] {message}", commit.commit_id);
         for change in &changes {
             println!("{} {}", change.kind.letter(), change.path);
+        }
+        if let (Some((name, _)), Some(advance)) = (&advancing, advance) {
+            self.report_advance(name, advance);
         }
         Ok(())
     }
@@ -932,18 +962,43 @@ impl Ctx<'_> {
         Ok(())
     }
 
-    fn log(&self, limit: u32) -> anyhow::Result<()> {
+    fn log(&self, limit: u32, from: Option<String>) -> anyhow::Result<()> {
+        let from_commit_id = from.map(|r| self.rev(&r)).transpose()?;
         let VcsResponse::Commits { commits } = self.call(VcsRequest::Log {
             repo_id: self.repo_id.clone(),
-            from_commit_id: None,
+            from_commit_id,
             limit,
         })?
         else {
             anyhow::bail!("unexpected response to log");
         };
+        // The live bookmarks on each commit; one in conflict shows on every
+        // candidate, marked with `?`.
+        let mut names: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for b in self.bookmarks()?.bookmarks {
+            if b.life
+                .as_ref()
+                .is_some_and(|l| l.kind != luvcs::api::VcsBookmarkLifeKind::Live)
+            {
+                continue;
+            }
+            let name = b.name.clone().unwrap_or_else(|| b.bookmark_id.clone());
+            match &b.target_commit_id {
+                Some(c) => names.entry(c.clone()).or_default().push(name),
+                None => {
+                    for c in &b.target_candidates {
+                        names.entry(c.clone()).or_default().push(format!("{name}?"));
+                    }
+                }
+            }
+        }
         for commit in commits {
+            let badges = names
+                .get(&commit.commit_id)
+                .map(|n| format!(" [{}]", n.join(", ")))
+                .unwrap_or_default();
             println!(
-                "{}{} {}",
+                "{}{}{badges} {}",
                 commit.commit_id,
                 if commit.is_head { " (head)" } else { "" },
                 commit.description
@@ -953,6 +1008,7 @@ impl Ctx<'_> {
     }
 
     fn restore(&self, commit: Option<String>, paths: &[String]) -> anyhow::Result<()> {
+        let commit = commit.map(|r| self.rev(&r)).transpose()?;
         let only: BTreeSet<String> = paths.iter().map(|p| normalize(p)).collect();
         for path in &only {
             if !self.tree.allows(path) {
@@ -1163,6 +1219,129 @@ mod tests {
         luv(a.path(), &["resolve", &names[0], "--take", "theirs"]).unwrap();
         assert!(ctx.conflict_names().unwrap().is_empty());
         luv(a.path(), &["commit", "-m", "merged"]).unwrap();
+    }
+
+    fn bookmark_list(dir: &Path) -> luvcs::api::VcsBookmarks {
+        let device = Local::open(dir).unwrap();
+        let repo = device.resolve_repo("notes").unwrap();
+        match device.execute(VcsRequest::ListBookmarks { repo_id: repo }) {
+            VcsResponse::Bookmarks { bookmarks } => bookmarks,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn target_of(dir: &Path, name: &str) -> Option<String> {
+        bookmark_list(dir)
+            .bookmarks
+            .into_iter()
+            .find(|b| b.name.as_deref() == Some(name))
+            .and_then(|b| b.target_commit_id)
+    }
+
+    #[test]
+    fn a_selected_bookmark_moves_with_commits_and_names_a_commit() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        luv(root, &["init", "--repo", "notes", "--include", "**/*.md"]).unwrap();
+        let file = root.join("n.md");
+        std::fs::write(&file, "one\n").unwrap();
+        luv(root, &["commit", "-m", "one"]).unwrap();
+        let one = base(root);
+        luv(root, &["bookmark", "create", "main"]).unwrap();
+        assert_eq!(target_of(root, "main"), Some(one.clone()));
+        assert!(
+            luv(root, &["bookmark", "create", "main"]).is_err(),
+            "name taken"
+        );
+
+        luv(root, &["bookmark", "select", "main"]).unwrap();
+        std::fs::write(&file, "two\n").unwrap();
+        luv(root, &["commit", "-m", "two"]).unwrap();
+        let two = base(root);
+        assert_eq!(target_of(root, "main"), Some(two.clone()));
+
+        // A bookmark names a commit wherever a commit is taken.
+        luv(root, &["bookmark", "create", "old", "--commit", &one]).unwrap();
+        luv(root, &["restore", "--commit", "old"]).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\n");
+        luv(root, &["restore", "--commit", "main"]).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "two\n");
+        luv(root, &["log", "--from", "old"]).unwrap();
+
+        luv(root, &["bookmark", "rename", "old", "first"]).unwrap();
+        assert_eq!(target_of(root, "first"), Some(one));
+        luv(root, &["bookmark", "default", "main"]).unwrap();
+        assert!(
+            luv(root, &["bookmark", "delete", "main"]).is_err(),
+            "the default"
+        );
+        luv(
+            root,
+            &["bookmark", "delete", "main", "--new-default", "first"],
+        )
+        .unwrap();
+        let listed = bookmark_list(root);
+        let first = listed
+            .bookmarks
+            .iter()
+            .find(|b| b.name.as_deref() == Some("first"))
+            .unwrap();
+        assert!(first.is_default);
+        // The deleted bookmark is still selected, but a commit moves nothing.
+        let main_of = |listed: &luvcs::api::VcsBookmarks| {
+            listed
+                .bookmarks
+                .iter()
+                .find(|b| b.name.as_deref() == Some("main"))
+                .map(|b| (b.is_selected, b.target_commit_id.clone()))
+                .unwrap()
+        };
+        assert_eq!(main_of(&listed), (true, Some(two.clone())));
+        std::fs::write(&file, "three\n").unwrap();
+        luv(root, &["commit", "-m", "three"]).unwrap();
+        assert_ne!(base(root), two);
+        assert_eq!(main_of(&bookmark_list(root)), (true, Some(two)));
+    }
+
+    #[test]
+    fn shared_names_and_split_targets_are_never_guessed() {
+        let (_remote, a, b) = two_devices();
+        // Both devices name the same commit "main" without seeing each other.
+        luv(a.path(), &["bookmark", "create", "main"]).unwrap();
+        luv(b.path(), &["bookmark", "create", "main"]).unwrap();
+        luv(a.path(), &["push"]).unwrap();
+        luv(b.path(), &["push"]).unwrap();
+        luv(a.path(), &["pull"]).unwrap();
+        let listed = bookmark_list(a.path());
+        assert_eq!(listed.bookmarks.len(), 2);
+        assert!(listed.bookmarks.iter().all(|b| b.name_shared));
+        let err = luv(a.path(), &["bookmark", "move", "main"]).unwrap_err();
+        assert!(err.to_string().contains("several bookmarks"), "{err}");
+        let ids: Vec<String> = listed
+            .bookmarks
+            .iter()
+            .map(|b| b.bookmark_id.clone())
+            .collect();
+        luv(a.path(), &["bookmark", "fuse", &ids[1], "--into", &ids[0]]).unwrap();
+        luv(a.path(), &["push"]).unwrap();
+        luv(b.path(), &["pull"]).unwrap();
+
+        // Now each moves it to its own commit.
+        let theirs = diverge(a.path(), b.path(), "1a\n2\n3\n", "1\n2\n3b\n");
+        let ours = base(a.path());
+        luv(a.path(), &["bookmark", "move", "main"]).unwrap();
+        luv(b.path(), &["bookmark", "move", "main"]).unwrap();
+        luv(b.path(), &["push"]).unwrap();
+        luv(a.path(), &["pull"]).unwrap();
+        let err = luv(a.path(), &["merge", "main"]).unwrap_err();
+        assert!(err.to_string().contains("several commits"), "{err}");
+        luv(a.path(), &["merge", &theirs]).unwrap();
+        luv(
+            a.path(),
+            &["bookmark", "resolve", "main", "--commit", &ours],
+        )
+        .unwrap();
+        assert_eq!(target_of(a.path(), "main"), Some(ours));
     }
 
     #[test]

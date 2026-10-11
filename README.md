@@ -70,12 +70,20 @@ luv init --include "**/*.md"
 luv status
 luv diff
 luv commit -m "message"
-luv log
+luv log [--from <rev>]
 luv restore [--commit cmt_...] [paths...]
 luv merge cmt_...
 luv resolve <path|obj_...> [--take ours|theirs] [--title <path>]
 luv undo
 luv redo
+luv bookmark list [--all]
+luv bookmark create|move <name> [--commit <rev>]
+luv bookmark rename <name> <new-name>
+luv bookmark delete <name> [--new-default <name> | --clear-default]
+luv bookmark fuse <name> --into <name>
+luv bookmark select <name> | --none
+luv bookmark default <name> | --clear
+luv bookmark resolve <name> [--commit <rev>] [--rename <name>] [--keep | --delete]
 luv remote set --path ../shared      # or --command "program args"
 luv push
 luv pull
@@ -92,7 +100,7 @@ include = ["**/*.md"]
 
 After concurrent commits a repo has several heads, and `luv log` shows them all. `merge` merges one of them into your last commit and writes the merged files. A file in conflict is written with `<<<<<<< left` / `>>>>>>> right` markers around each conflicting region (the conflict itself is still stored as a `Conflict` object, not as markers); `status` lists it as `C`, and `commit` refuses until `resolve` settles it, by default with the file as you edited it on disk, or with one side whole (`--take`). A conflict that is no file in the work tree (outside the allowlist, say) is listed by its `obj_…` ID and settled with `--take`. `undo` and `redo` step through the operation log (a commit, a merge, a resolve, a save) and write the files back. `merge`, `undo` and `redo` refuse while files on disk differ from what is saved, so they never overwrite your edits.
 
-Bookmarks exist in the request API but not yet in the CLI. Symbolic links are not tracked; luv prints a warning and skips them.
+Wherever a command takes a commit (`<rev>`, `restore --commit`, `merge`, `log --from`), a bookmark name or a `bmk_…` ID works too. `luv commit` moves the selected bookmark forward; `luv log` shows the bookmarks on each commit. A name two bookmarks share, or a bookmark whose target is in conflict, is refused rather than guessed: use the `bmk_…` ID, and settle it with `rename`, `fuse` or `resolve`. Symbolic links are not tracked; luv prints a warning and skips them.
 
 ## Layout
 

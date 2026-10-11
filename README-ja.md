@@ -70,12 +70,20 @@ luv init --include "**/*.md"
 luv status
 luv diff
 luv commit -m "message"
-luv log
+luv log [--from <rev>]
 luv restore [--commit cmt_...] [paths...]
 luv merge cmt_...
 luv resolve <path|obj_...> [--take ours|theirs] [--title <path>]
 luv undo
 luv redo
+luv bookmark list [--all]
+luv bookmark create|move <name> [--commit <rev>]
+luv bookmark rename <name> <new-name>
+luv bookmark delete <name> [--new-default <name> | --clear-default]
+luv bookmark fuse <name> --into <name>
+luv bookmark select <name> | --none
+luv bookmark default <name> | --clear
+luv bookmark resolve <name> [--commit <rev>] [--rename <name>] [--keep | --delete]
 luv remote set --path ../shared      # または --command "program args"
 luv push
 luv pull
@@ -92,7 +100,7 @@ include = ["**/*.md"]
 
 同時にコミットされたあとの repo は複数の HEAD を持ち、`luv log` はそのすべてを表示します。`merge` は、そのうちの 1 つを最後のコミットに統合し、統合結果のファイルを書き出します。衝突したファイルは、衝突した箇所を `<<<<<<< left` / `>>>>>>> right` のマーカーで囲んで書き出します（衝突そのものは、マーカーではなく `Conflict` オブジェクトとして保存されたままです）。`status` はそのファイルを `C` と表示し、`resolve` で解消するまで `commit` は拒否されます。`resolve` は既定ではディスク上で編集したファイルの内容で解消し、`--take` を付けると片側をそのまま採用します。作業ツリーのファイルにならない衝突（include の外にあるものなど）は `obj_…` の ID で表示され、`--take` で解消します。`undo` と `redo` は操作ログ（コミット、統合、解消、保存）を 1 つずつ戻し・進め、ファイルも書き戻します。`merge`・`undo`・`redo` は、ディスク上のファイルが保存済みの内容と違うあいだは実行を拒否するので、手元の編集を上書きすることはありません。
 
-ブックマークはリクエスト API にはありますが、CLI にはまだありません。シンボリックリンクは追跡せず、警告を出して飛ばします。
+コミットを受け取る場所（`<rev>`、`restore --commit`、`merge`、`log --from`）では、ブックマーク名や `bmk_…` の ID も使えます。`luv commit` は選択中のブックマークを前に進め、`luv log` は各コミットに付いているブックマークを表示します。2 つのブックマークが同じ名前を持っているときや、指す先が衝突しているブックマークは、推測せずにエラーにします。`bmk_…` の ID を使い、`rename`・`fuse`・`resolve` で解消してください。シンボリックリンクは追跡せず、警告を出して飛ばします。
 
 ## 構成
 
