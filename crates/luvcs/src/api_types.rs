@@ -491,6 +491,12 @@ pub struct VcsConflictView {
     /// Everything that did merge, as provisional full text (text driver).
     #[cfg_attr(feature = "ts", ts(optional = nullable))]
     pub merged_text: Option<String>,
+    /// For a text conflict: the full text with `<<<<<<<` / `=======` /
+    /// `>>>>>>>` markers around each conflicting region, for a file a person
+    /// edits. Display only; the conflict itself is never stored this way.
+    #[serde(default)]
+    #[cfg_attr(feature = "ts", ts(optional = nullable))]
+    pub marked_text: Option<String>,
     /// Provisional record including non-conflicting fields, in record JSON form.
     #[serde(default)]
     #[cfg_attr(feature = "ts", ts(optional = nullable))]

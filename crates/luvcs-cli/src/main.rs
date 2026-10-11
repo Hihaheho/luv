@@ -16,10 +16,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use eure::FromEure;
 use globset::{Glob, GlobSet, GlobSetBuilder};
-use luvcs::api::{VcsObjectView, VcsRequest, VcsResponse};
+use luvcs::api::{VcsObjectView, VcsRequest, VcsResolution, VcsResponse};
 
 use local::Local;
 
@@ -121,6 +121,30 @@ pub enum LuvCommands {
         /// Only these paths (default: every tracked file)
         paths: Vec<String>,
     },
+    /// Merge another head (cmt_…) into the last commit. The merged files
+    /// are written to disk; a file in conflict gets markers around each
+    /// conflicting region until `luv resolve`
+    Merge {
+        /// The commit to merge, e.g. a head `luv log` lists
+        commit: String,
+    },
+    /// Settle a file in conflict: by default with the file as it is on disk
+    Resolve {
+        /// The file in conflict
+        path: String,
+        /// Take one side whole instead of the file on disk
+        #[arg(long, value_enum, conflicts_with = "title")]
+        take: Option<Side>,
+        /// The file's path from now on, when the two sides named it
+        /// differently (default: where it is on disk)
+        #[arg(long)]
+        title: Option<String>,
+    },
+    /// Undo the last operation (a commit, a merge, a resolve, a save) and
+    /// write the files back as they were
+    Undo,
+    /// Redo the last undone operation
+    Redo,
     /// Choose where `push` and `pull` go
     Remote {
         #[command(subcommand)]
@@ -140,6 +164,15 @@ pub enum LuvCommands {
     },
 }
 
+/// One side of a merge.
+#[derive(ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    /// The last commit before the merge
+    Ours,
+    /// The commit merged in
+    Theirs,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum RemoteCommands {
     /// Set the remote: a directory several devices reach, or a command that
@@ -157,19 +190,18 @@ pub enum RemoteCommands {
 }
 
 fn main() -> anyhow::Result<()> {
-    run(LuvArgs::parse())
+    run(&std::env::current_dir()?, LuvArgs::parse())
 }
 
-fn run(args: LuvArgs) -> anyhow::Result<()> {
-    let cwd = std::env::current_dir()?;
+fn run(cwd: &Path, args: LuvArgs) -> anyhow::Result<()> {
     match args.command {
-        LuvCommands::Init { repo, include } => return init(&cwd, repo, include),
-        LuvCommands::Remote { command } => return remote_command(&cwd, command),
-        LuvCommands::Pull => return pull(&cwd),
+        LuvCommands::Init { repo, include } => return init(cwd, repo, include),
+        LuvCommands::Remote { command } => return remote_command(cwd, command),
+        LuvCommands::Pull => return pull(cwd),
         LuvCommands::Serve { path } => return serve(&path),
         _ => {}
     }
-    let tree = WorkTree::discover(&cwd)?;
+    let tree = WorkTree::discover(cwd)?;
     let device = Local::open(&tree.root)?;
     let repo_id = device.resolve_repo(&tree.config.repo)?;
     let ctx = Ctx {
@@ -188,6 +220,10 @@ fn run(args: LuvArgs) -> anyhow::Result<()> {
         LuvCommands::Commit { message, paths } => ctx.commit(&message, &paths),
         LuvCommands::Log { limit } => ctx.log(limit),
         LuvCommands::Restore { commit, paths } => ctx.restore(commit, &paths),
+        LuvCommands::Merge { commit } => ctx.merge(&commit),
+        LuvCommands::Resolve { path, take, title } => ctx.resolve(&path, take, title),
+        LuvCommands::Undo => ctx.undo(true),
+        LuvCommands::Redo => ctx.undo(false),
     }
 }
 
@@ -420,6 +456,20 @@ struct Ctx<'a> {
     repo_id: String,
 }
 
+/// The file an object is: its title, or for a conflict over the title
+/// itself, our side's title (the file stays where it was).
+fn path_of(object: &VcsObjectView) -> Option<String> {
+    if let Some(title) = &object.title {
+        return Some(title.clone());
+    }
+    let conflict = object.conflict.as_ref()?;
+    conflict
+        .terms
+        .iter()
+        .find(|t| t.kind == "metadata" && t.path == "title")
+        .and_then(|t| t.candidates.first().cloned().flatten())
+}
+
 fn text_of(bytes: &[u8]) -> Option<&str> {
     let text = std::str::from_utf8(bytes).ok()?;
     (!text.contains('\0')).then_some(text)
@@ -444,7 +494,7 @@ impl Ctx<'_> {
         };
         let mut by_path = BTreeMap::new();
         for object in objects {
-            let Some(title) = object.title.clone() else {
+            let Some(title) = path_of(&object) else {
                 continue;
             };
             if object.body_kind == "deleted" || !self.tree.allows(&title) {
@@ -494,9 +544,16 @@ impl Ctx<'_> {
         }
         let disk = self.tree.scan()?;
         let mut saved = self.saved()?;
+        // A file in conflict is settled by `luv resolve`, not compared.
+        let conflicted: BTreeSet<String> = saved
+            .iter()
+            .filter(|(_, o)| o.body_kind == "conflict")
+            .map(|(p, _)| p.clone())
+            .collect();
+        saved.retain(|p, _| !conflicted.contains(p));
         let mut changes = Vec::new();
         for (path, bytes) in disk {
-            if !wanted(&path) {
+            if !wanted(&path) || conflicted.contains(&path) {
                 continue;
             }
             match saved.remove(&path) {
@@ -551,12 +608,216 @@ impl Ctx<'_> {
         for change in &changes {
             println!("{} {}", change.kind.letter(), change.path);
         }
-        for conflict in &status.conflicts {
-            println!("C {}", conflict.object_id);
+        // Saved but not committed: what an undone commit or a resolve
+        // leaves; the next `luv commit` records it.
+        let pending: Vec<_> = status.changes.iter().filter(|c| !c.conflicted).collect();
+        if !pending.is_empty() {
+            println!("saved, not committed yet:");
+            for change in &pending {
+                let letter = match change.kind.as_str() {
+                    "added" => 'A',
+                    "removed" => 'D',
+                    _ => 'M',
+                };
+                let name = change.title.as_deref().unwrap_or(&change.object_id);
+                println!("  {letter} {name}");
+            }
         }
-        if changes.is_empty() && status.conflicts.is_empty() {
+        let paths = self.conflict_names()?;
+        for path in &paths {
+            println!("C {path}");
+        }
+        if !paths.is_empty() {
+            println!("resolve each with `luv resolve <path>` (an obj_… with --take)");
+        }
+        if changes.is_empty() && pending.is_empty() && paths.is_empty() {
             println!("nothing to commit");
         }
+        Ok(())
+    }
+
+    /// Every conflict in the working tree, sorted: by its path when it is
+    /// a file here, else by its object ID (outside the allowlist, or with
+    /// no path to put it at), so none is ever left out.
+    fn conflict_names(&self) -> anyhow::Result<Vec<String>> {
+        let VcsResponse::Status { status } = self.call(VcsRequest::Status {
+            repo_id: self.repo_id.clone(),
+        })?
+        else {
+            anyhow::bail!("unexpected response to status");
+        };
+        let paths: BTreeMap<String, String> = self
+            .saved()?
+            .into_iter()
+            .map(|(path, object)| (object.object_id, path))
+            .collect();
+        let mut names: Vec<String> = status
+            .conflicts
+            .iter()
+            .map(|c| paths.get(&c.object_id).unwrap_or(&c.object_id).clone())
+            .collect();
+        names.sort();
+        Ok(names)
+    }
+
+    /// Refuses when files on disk differ from what is saved: an operation
+    /// that rewrites the files would lose them.
+    fn ensure_clean(&self, what: &str) -> anyhow::Result<()> {
+        let changes = self.changes(&[])?;
+        if !changes.is_empty() {
+            let paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
+            anyhow::bail!(
+                "{what} would overwrite changes on disk ({}); commit or restore them first",
+                paths.join(", ")
+            );
+        }
+        Ok(())
+    }
+
+    /// What a saved object looks like as a file.
+    fn bytes_of(&self, path: &str, object: &VcsObjectView) -> anyhow::Result<Vec<u8>> {
+        Ok(match object.body_kind.as_str() {
+            "text" => object.text.clone().unwrap_or_default().into_bytes(),
+            "binary" => {
+                let blob = object
+                    .blob
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("{path}: binary object has no blob"))?;
+                if !blob.present {
+                    anyhow::bail!("{path}: the bytes are not on this device yet (fetch first)");
+                }
+                self.read_blob(&blob.blob_id)?
+            }
+            "conflict" => {
+                let conflict = object
+                    .conflict
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("{path}: conflict without its view"))?;
+                match (&conflict.marked_text, conflict.sides.first()) {
+                    (Some(marked), _) => marked.clone().into_bytes(),
+                    // Not a text conflict: our side stays on disk.
+                    (None, Some(Some(ours))) => ours.clone().into_bytes(),
+                    _ => anyhow::bail!("{path}: resolve with `luv resolve --take`"),
+                }
+            }
+            other => anyhow::bail!("{path}: cannot write a {other} object"),
+        })
+    }
+
+    /// Makes the files on disk match what is saved, given what was saved
+    /// before (and on disk, as `ensure_clean` checked): files that left
+    /// are removed, the others written where they differ.
+    fn checkout(&self, before: &BTreeMap<String, VcsObjectView>) -> anyhow::Result<()> {
+        let after = self.saved()?;
+        for path in before.keys().filter(|p| !after.contains_key(*p)) {
+            let file = self.tree.root.join(path);
+            if std::fs::symlink_metadata(&file).is_ok_and(|m| m.is_file()) {
+                std::fs::remove_file(&file)?;
+                println!("removed {path}");
+            }
+        }
+        for (path, object) in &after {
+            if before.get(path).map(|o| &o.state_id) == Some(&object.state_id) {
+                continue;
+            }
+            let bytes = self.bytes_of(path, object)?;
+            if std::fs::read(self.tree.root.join(path)).ok().as_deref() != Some(&bytes[..]) {
+                self.tree.write(path, &bytes)?;
+                println!("wrote {path}");
+            }
+        }
+        Ok(())
+    }
+
+    fn merge(&self, commit: &str) -> anyhow::Result<()> {
+        self.ensure_clean("merge")?;
+        let before = self.saved()?;
+        let VcsResponse::Integrated {
+            commit_id,
+            conflicts,
+        } = self.call(VcsRequest::Integrate {
+            repo_id: self.repo_id.clone(),
+            commit_id: commit.to_owned(),
+        })?
+        else {
+            anyhow::bail!("unexpected response to merge");
+        };
+        self.checkout(&before)?;
+        println!("[{commit_id}] merged {commit}");
+        if !conflicts.is_empty() {
+            for path in self.conflict_names()? {
+                println!("C {path}");
+            }
+            println!("resolve each with `luv resolve <path>`, then `luv commit`");
+        }
+        Ok(())
+    }
+
+    fn resolve(&self, path: &str, take: Option<Side>, title: Option<String>) -> anyhow::Result<()> {
+        let path = normalize(path);
+        let before = self.saved()?;
+        // A file in conflict, or a conflict that is no file here (named by
+        // its object ID), which only a side can settle.
+        let object_id = match before.get(&path).filter(|o| o.body_kind == "conflict") {
+            Some(object) => object.object_id.clone(),
+            None if self.conflict_names()?.contains(&path) => {
+                if take.is_none() {
+                    anyhow::bail!("{path} is not a file here; use --take ours or --take theirs");
+                }
+                path.clone()
+            }
+            None => anyhow::bail!("{path} is not in conflict"),
+        };
+        let resolution = match take {
+            Some(side) => VcsResolution::Side {
+                index: match side {
+                    Side::Ours => 0,
+                    Side::Theirs => 1,
+                },
+            },
+            None => {
+                let bytes = std::fs::read(self.tree.root.join(&path))?;
+                let text = text_of(&bytes).ok_or_else(|| {
+                    anyhow::anyhow!("{path} is not text on disk; use --take ours or --take theirs")
+                })?;
+                if text
+                    .lines()
+                    .any(|l| l == "<<<<<<< left" || l == ">>>>>>> right")
+                {
+                    anyhow::bail!("{path} still has conflict markers; edit them out first");
+                }
+                VcsResolution::Text {
+                    text: text.to_owned(),
+                    title: Some(title.map(|t| normalize(&t)).unwrap_or_else(|| path.clone())),
+                }
+            }
+        };
+        self.call(VcsRequest::Resolve {
+            repo_id: self.repo_id.clone(),
+            object_id,
+            resolution,
+        })?;
+        self.checkout(&before)?;
+        println!("resolved {path}");
+        Ok(())
+    }
+
+    fn undo(&self, undo: bool) -> anyhow::Result<()> {
+        let what = if undo { "undo" } else { "redo" };
+        self.ensure_clean(what)?;
+        let before = self.saved()?;
+        let repo_id = self.repo_id.clone();
+        let request = if undo {
+            VcsRequest::Undo { repo_id }
+        } else {
+            VcsRequest::Redo { repo_id }
+        };
+        let VcsResponse::Operation { operation } = self.call(request)? else {
+            anyhow::bail!("unexpected response to {what}");
+        };
+        self.checkout(&before)?;
+        let done = if undo { "undid" } else { "redid" };
+        println!("{done} {} {}", operation.kind, operation.reason);
         Ok(())
     }
 
@@ -581,6 +842,13 @@ impl Ctx<'_> {
     }
 
     fn commit(&self, message: &str, paths: &[String]) -> anyhow::Result<()> {
+        let conflicts = self.conflict_names()?;
+        if !conflicts.is_empty() {
+            anyhow::bail!(
+                "{} in conflict; resolve with `luv resolve <path>` first",
+                conflicts.join(", ")
+            );
+        }
         let changes = self.changes(paths)?;
         let mut selected = Vec::new();
         for change in &changes {
@@ -715,22 +983,7 @@ impl Ctx<'_> {
                     object_id: object.object_id.clone(),
                 })?;
             }
-            let bytes = match object.body_kind.as_str() {
-                "text" => object.text.clone().unwrap_or_default().into_bytes(),
-                "binary" => {
-                    let blob = object
-                        .blob
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!("{title}: binary object has no blob"))?;
-                    if !blob.present {
-                        anyhow::bail!(
-                            "{title}: the bytes are not on this device yet (fetch first)"
-                        );
-                    }
-                    self.read_blob(&blob.blob_id)?
-                }
-                other => anyhow::bail!("{title}: cannot restore a {other} object"),
-            };
+            let bytes = self.bytes_of(&title, &object)?;
             self.tree.write(&title, &bytes)?;
             println!("restored {title}");
             restored += 1;
@@ -773,6 +1026,183 @@ fn normalize(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Runs `luv args…` in `dir`.
+    fn luv(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
+        let argv = std::iter::once("luv").chain(args.iter().copied());
+        run(dir, LuvArgs::try_parse_from(argv)?)
+    }
+
+    fn heads(dir: &Path) -> Vec<String> {
+        let device = Local::open(dir).unwrap();
+        let repo = device.resolve_repo("notes").unwrap();
+        match device.execute(VcsRequest::Heads { repo_id: repo }) {
+            VcsResponse::Heads { heads } => heads,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    fn base(dir: &Path) -> String {
+        let device = Local::open(dir).unwrap();
+        let repo = device.resolve_repo("notes").unwrap();
+        match device.execute(VcsRequest::Status { repo_id: repo }) {
+            VcsResponse::Status { status } => status.base_commit_id.unwrap(),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Two work trees of one repo through a directory remote, at a commit
+    /// of `n.md` = "1\n2\n3\n".
+    fn two_devices() -> (tempfile::TempDir, tempfile::TempDir, tempfile::TempDir) {
+        let remote = tempfile::tempdir().unwrap();
+        let path = remote.path().to_str().unwrap();
+        let a = tempfile::tempdir().unwrap();
+        luv(
+            a.path(),
+            &["init", "--repo", "notes", "--include", "**/*.md"],
+        )
+        .unwrap();
+        std::fs::write(a.path().join("n.md"), "1\n2\n3\n").unwrap();
+        luv(a.path(), &["commit", "-m", "base"]).unwrap();
+        luv(a.path(), &["remote", "set", "--path", path]).unwrap();
+        luv(a.path(), &["push"]).unwrap();
+        let b = tempfile::tempdir().unwrap();
+        luv(b.path(), &["remote", "set", "--path", path]).unwrap();
+        luv(b.path(), &["pull"]).unwrap();
+        luv(
+            b.path(),
+            &["init", "--repo", "notes", "--include", "**/*.md"],
+        )
+        .unwrap();
+        luv(b.path(), &["restore"]).unwrap();
+        (remote, a, b)
+    }
+
+    /// Commits `a_text` on a and `b_text` on b, syncs, and returns b's head
+    /// as a sees it.
+    fn diverge(a: &Path, b: &Path, a_text: &str, b_text: &str) -> String {
+        std::fs::write(a.join("n.md"), a_text).unwrap();
+        luv(a, &["commit", "-m", "a"]).unwrap();
+        luv(a, &["push"]).unwrap();
+        std::fs::write(b.join("n.md"), b_text).unwrap();
+        luv(b, &["commit", "-m", "b"]).unwrap();
+        luv(b, &["push"]).unwrap();
+        luv(a, &["pull"]).unwrap();
+        let ours = base(a);
+        let heads = heads(a);
+        assert_eq!(heads.len(), 2, "{heads:?}");
+        heads.into_iter().find(|h| *h != ours).unwrap()
+    }
+
+    #[test]
+    fn merge_writes_the_merged_files() {
+        let (_remote, a, b) = two_devices();
+        let theirs = diverge(a.path(), b.path(), "1a\n2\n3\n", "1\n2\n3b\n");
+        luv(a.path(), &["merge", &theirs]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(a.path().join("n.md")).unwrap(),
+            "1a\n2\n3b\n"
+        );
+        assert_eq!(heads(a.path()).len(), 1);
+    }
+
+    #[test]
+    fn a_conflict_is_settled_from_the_file_on_disk() {
+        let (_remote, a, b) = two_devices();
+        let theirs = diverge(a.path(), b.path(), "1\n2a\n3\n", "1\n2b\n3\n");
+        let file = a.path().join("n.md");
+        // Changes on disk would be lost: merge refuses.
+        std::fs::write(&file, "1\n2a\n3\nmore\n").unwrap();
+        assert!(luv(a.path(), &["merge", &theirs]).is_err());
+        luv(a.path(), &["restore"]).unwrap();
+
+        luv(a.path(), &["merge", &theirs]).unwrap();
+        let marked = std::fs::read_to_string(&file).unwrap();
+        assert!(marked.contains("<<<<<<< left\n2a\n"), "{marked}");
+        assert!(marked.contains("=======\n2b\n>>>>>>> right\n"), "{marked}");
+        let err = luv(a.path(), &["commit", "-m", "too early"]).unwrap_err();
+        assert!(err.to_string().contains("in conflict"), "{err}");
+        assert!(
+            luv(a.path(), &["resolve", "n.md"]).is_err(),
+            "markers are refused"
+        );
+
+        std::fs::write(&file, "1\n2ab\n3\n").unwrap();
+        luv(a.path(), &["resolve", "n.md"]).unwrap();
+        luv(a.path(), &["commit", "-m", "merged"]).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "1\n2ab\n3\n");
+        assert_eq!(heads(a.path()).len(), 1);
+    }
+
+    #[test]
+    fn a_conflict_outside_the_allowlist_still_blocks_commit() {
+        let (_remote, a, b) = two_devices();
+        let theirs = diverge(a.path(), b.path(), "1\n2a\n3\n", "1\n2b\n3\n");
+        // n.md leaves the allowlist before the merge.
+        let config = LuvConfig {
+            repo: "notes".into(),
+            include: vec!["**/*.txt".into()],
+        };
+        std::fs::write(a.path().join(CONFIG_FILE), config.render()).unwrap();
+        luv(a.path(), &["merge", &theirs]).unwrap();
+        let err = luv(a.path(), &["commit", "-m", "too early"]).unwrap_err();
+        assert!(err.to_string().contains("obj_"), "{err}");
+        let tree = WorkTree::discover(a.path()).unwrap();
+        let device = Local::open(a.path()).unwrap();
+        let ctx = Ctx {
+            device: &device,
+            tree: &tree,
+            repo_id: device.resolve_repo("notes").unwrap(),
+        };
+        let names = ctx.conflict_names().unwrap();
+        assert_eq!(names.len(), 1);
+        assert!(
+            luv(a.path(), &["resolve", &names[0]]).is_err(),
+            "needs --take"
+        );
+        luv(a.path(), &["resolve", &names[0], "--take", "theirs"]).unwrap();
+        assert!(ctx.conflict_names().unwrap().is_empty());
+        luv(a.path(), &["commit", "-m", "merged"]).unwrap();
+    }
+
+    #[test]
+    fn take_theirs_writes_their_side() {
+        let (_remote, a, b) = two_devices();
+        let theirs = diverge(a.path(), b.path(), "1\n2a\n3\n", "1\n2b\n3\n");
+        luv(a.path(), &["merge", &theirs]).unwrap();
+        luv(a.path(), &["resolve", "n.md", "--take", "theirs"]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(a.path().join("n.md")).unwrap(),
+            "1\n2b\n3\n"
+        );
+    }
+
+    #[test]
+    fn undo_and_redo_write_the_files_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        luv(root, &["init", "--repo", "notes", "--include", "**/*.md"]).unwrap();
+        let file = root.join("n.md");
+        std::fs::write(&file, "one\n").unwrap();
+        luv(root, &["commit", "-m", "one"]).unwrap();
+        std::fs::write(&file, "two\n").unwrap();
+        luv(root, &["commit", "-m", "two"]).unwrap();
+        let two = base(root);
+        // The commit, then the save before it.
+        luv(root, &["undo"]).unwrap();
+        assert_ne!(base(root), two);
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "two\n");
+        luv(root, &["undo"]).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\n");
+        // Unsaved edits block an undo.
+        std::fs::write(&file, "edited\n").unwrap();
+        assert!(luv(root, &["undo"]).is_err());
+        std::fs::write(&file, "one\n").unwrap();
+        luv(root, &["redo"]).unwrap();
+        luv(root, &["redo"]).unwrap();
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "two\n");
+        assert_eq!(base(root), two);
+    }
 
     fn tree(include: &[&str]) -> WorkTree {
         let config = LuvConfig {

@@ -681,9 +681,39 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                 Some(m) if c.driver != "merge.record.v1" => self.content_text(m)?,
                 _ => None,
             },
+            marked_text: self.marked_text(&c)?,
             sides,
             terms,
         })
+    }
+
+    /// A text conflict as full text with markers around each conflicting
+    /// region, merged again from its base and sides; `None` for any other
+    /// conflict.
+    fn marked_text(&self, c: &crate::model::Conflict) -> ApiResult<Option<String>> {
+        let text = |id: &ObjectStateId| -> ApiResult<Option<Vec<u8>>> {
+            Ok(match self.repo.get_state(*id)?.body {
+                ObjectBody::Text { content } => self.repo.get_content(content)?,
+                _ => None,
+            })
+        };
+        if c.driver != crate::merge::TEXT_DRIVER_V1 {
+            return Ok(None);
+        }
+        let [l, r] = c.sides.as_slice() else {
+            return Ok(None);
+        };
+        let (Some(left), Some(right)) = (text(l)?, text(r)?) else {
+            return Ok(None);
+        };
+        let base = match c.base.as_slice() {
+            [] => None,
+            [b] => text(b)?,
+            _ => return Ok(None),
+        };
+        let outcome = crate::merge::text::merge_text(base.as_deref(), &left, &right);
+        let marked = crate::merge::text::render_with_markers(&outcome);
+        Ok(Some(String::from_utf8_lossy(&marked).into_owned()))
     }
 
     fn object_view(

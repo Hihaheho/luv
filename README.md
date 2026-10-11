@@ -72,6 +72,10 @@ luv diff
 luv commit -m "message"
 luv log
 luv restore [--commit cmt_...] [paths...]
+luv merge cmt_...
+luv resolve <path|obj_...> [--take ours|theirs] [--title <path>]
+luv undo
+luv redo
 luv remote set --path ../shared      # or --command "program args"
 luv push
 luv pull
@@ -86,7 +90,9 @@ include = ["**/*.md"]
 
 `remote set` writes `.luv/remote.eure`, next to the store. `Luv.eure`, the file that is meant to travel with the files, never names a command, and `.luv`, `.git` and `.jj` are never tracked or restored at any depth, so files that come from someone else's history cannot change the remote or make `luv` run a command. `push` sends what the remote has not seen and never conflicts. `pull` takes the remote's history in and leaves your files alone. A remote is trusted like a secret: the first time a repo arrives from a remote, luv accepts the ID key that remote gives it, so pull only from remotes you trust. A second device starts with `remote set`, `pull`, then `init --repo <name>`, which attaches to the repo that was pulled, and `restore`.
 
-Undo / redo, integrate, conflict resolution and bookmarks exist in the request API but not yet in the CLI. After concurrent commits a repo has several heads and `luv log` shows them all; merging them from the CLI is not there yet. Symbolic links are not tracked; luv prints a warning and skips them.
+After concurrent commits a repo has several heads, and `luv log` shows them all. `merge` merges one of them into your last commit and writes the merged files. A file in conflict is written with `<<<<<<< left` / `>>>>>>> right` markers around each conflicting region (the conflict itself is still stored as a `Conflict` object, not as markers); `status` lists it as `C`, and `commit` refuses until `resolve` settles it, by default with the file as you edited it on disk, or with one side whole (`--take`). A conflict that is no file in the work tree (outside the allowlist, say) is listed by its `obj_…` ID and settled with `--take`. `undo` and `redo` step through the operation log (a commit, a merge, a resolve, a save) and write the files back. `merge`, `undo` and `redo` refuse while files on disk differ from what is saved, so they never overwrite your edits.
+
+Bookmarks exist in the request API but not yet in the CLI. Symbolic links are not tracked; luv prints a warning and skips them.
 
 ## Layout
 
