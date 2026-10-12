@@ -637,3 +637,71 @@ fn bookmarks_travel_and_concurrent_moves_conflict_the_same_everywhere() {
     moved.sort();
     assert_eq!(candidates, moved);
 }
+
+#[test]
+fn a_criss_cross_merge_looks_at_every_merge_base() {
+    let remote = MemoryRemote::new();
+    let a = Device::new(0);
+    let repo = a.create("notes");
+    let x = a.save_text(&repo, None, "x0\n");
+    let y = a.save_text(&repo, None, "y0\n");
+    let z = a.save_text(&repo, None, "z0\n");
+    let w = a.save_text(&repo, None, "w0\n");
+    a.record(&repo, "base");
+    a.push(&remote, &repo);
+    let b = Device::new(100);
+    b.pull(&remote);
+
+    let integrate_other = |d: &Device| {
+        let status = match d.run(VcsRequest::Status {
+            repo_id: repo.clone(),
+        }) {
+            VcsResponse::Status { status } => status,
+            other => panic!("{other:?}"),
+        };
+        let theirs = status
+            .heads
+            .iter()
+            .find(|h| Some(h.as_str()) != status.base_commit_id.as_deref())
+            .unwrap()
+            .clone();
+        match d.run(VcsRequest::Integrate {
+            repo_id: repo.clone(),
+            commit_id: theirs,
+        }) {
+            VcsResponse::Integrated {
+                commit_id,
+                conflicts,
+            } => (commit_id, conflicts),
+            other => panic!("{other:?}"),
+        }
+    };
+
+    // Each side edits one object, then each integrates the other: two merge
+    // commits whose merge bases are both edits.
+    a.save_text(&repo, Some(&x), "x from a\n");
+    a.record(&repo, "a1");
+    b.save_text(&repo, Some(&y), "y from b\n");
+    b.record(&repo, "b1");
+    a.push(&remote, &repo);
+    b.push(&remote, &repo);
+    a.pull(&remote);
+    b.pull(&remote);
+    assert!(integrate_other(&a).1.is_empty());
+    assert!(integrate_other(&b).1.is_empty());
+
+    a.save_text(&repo, Some(&z), "z from a\n");
+    a.record(&repo, "a2");
+    b.save_text(&repo, Some(&x), "x from b\n");
+    b.record(&repo, "b2");
+    b.push(&remote, &repo);
+    a.pull(&remote);
+    let (merged, conflicts) = integrate_other(&a);
+    // `x`: the bases disagree (a1 changed it), so there is no single base
+    // to tell which side's edit is newer.
+    assert_eq!(conflicts.len(), 1);
+    assert_eq!(conflicts[0].object_id, x);
+    assert_eq!(a.text_at(&repo, &y, &merged), "y from b\n");
+    assert_eq!(a.text_at(&repo, &z, &merged), "z from a\n");
+    assert_eq!(a.text_at(&repo, &w, &merged), "w0\n");
+}

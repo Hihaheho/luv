@@ -235,6 +235,186 @@ fn build_range<D: Digest>(
     Ok(id)
 }
 
+/// The tree at `root` with `changes` applied (`None` removes the key),
+/// reading and writing only the nodes on the changed paths. The result is
+/// the canonical tree of the new map, the same [`build`] gives; `nodes`
+/// holds the nodes this created, which may include some the store has.
+pub fn update<D, F>(
+    digest: &D,
+    key: &IdKey,
+    root: TreeId,
+    changes: &BTreeMap<ObjectId, Option<ObjectStateId>>,
+    fetch: F,
+) -> Result<BuiltTree, TreeError>
+where
+    D: Digest,
+    F: FnMut(&TreeId) -> Option<Vec<u8>>,
+{
+    let mut updater = Updater {
+        digest,
+        key,
+        fetch,
+        nodes: BTreeMap::new(),
+    };
+    let changes: Vec<(ObjectId, Option<ObjectStateId>)> =
+        changes.iter().map(|(k, v)| (*k, *v)).collect();
+    let root = match updater.apply(Some(root), &changes, 0)? {
+        Some(id) => id,
+        None => updater.put(Node::Empty)?,
+    };
+    Ok(BuiltTree {
+        root,
+        nodes: updater.nodes,
+    })
+}
+
+struct Updater<'a, D, F> {
+    digest: &'a D,
+    key: &'a IdKey,
+    fetch: F,
+    nodes: BTreeMap<TreeId, Node>,
+}
+
+impl<D, F> Updater<'_, D, F>
+where
+    D: Digest,
+    F: FnMut(&TreeId) -> Option<Vec<u8>>,
+{
+    fn load(&mut self, id: TreeId) -> Result<Node, TreeError> {
+        if let Some(node) = self.nodes.get(&id) {
+            return Ok(node.clone());
+        }
+        let bytes = (self.fetch)(&id).ok_or(TreeError::Missing(id))?;
+        let node = Node::decode(&bytes)?;
+        if node.id(self.digest, self.key)? != id {
+            return Err(TreeError::IdMismatch(id));
+        }
+        Ok(node)
+    }
+
+    fn put(&mut self, node: Node) -> Result<TreeId, TreeError> {
+        let id = node.id(self.digest, self.key)?;
+        self.nodes.insert(id, node);
+        Ok(id)
+    }
+
+    /// The canonical subtree of `entries` (sorted, unique), or `None`.
+    fn build(
+        &mut self,
+        entries: &[(ObjectId, ObjectStateId)],
+        depth: u16,
+    ) -> Result<Option<TreeId>, TreeError> {
+        if entries.is_empty() {
+            return Ok(None);
+        }
+        let items: Vec<(&ObjectId, &ObjectStateId)> = entries.iter().map(|(k, v)| (k, v)).collect();
+        Ok(Some(build_range(
+            self.digest,
+            self.key,
+            &items,
+            depth,
+            &mut self.nodes,
+        )?))
+    }
+
+    /// Two subtrees split at bit `prefix_len` (left holds the 0 side).
+    fn join(
+        &mut self,
+        prefix_len: u16,
+        prefix: [u8; 16],
+        left: Option<TreeId>,
+        right: Option<TreeId>,
+    ) -> Result<Option<TreeId>, TreeError> {
+        Ok(match (left, right) {
+            (Some(left), Some(right)) => Some(self.put(Node::Branch {
+                prefix_len,
+                prefix: mask_prefix(&prefix, prefix_len),
+                left,
+                right,
+            })?),
+            (one, None) | (None, one) => one,
+        })
+    }
+
+    /// `node` (`None`: empty) with `changes` (sorted) applied. Every key in
+    /// both agrees on the first `depth` bits.
+    fn apply(
+        &mut self,
+        node: Option<TreeId>,
+        changes: &[(ObjectId, Option<ObjectStateId>)],
+        depth: u16,
+    ) -> Result<Option<TreeId>, TreeError> {
+        if changes.is_empty() {
+            return Ok(node);
+        }
+        let inserts = |changes: &[(ObjectId, Option<ObjectStateId>)]| {
+            changes
+                .iter()
+                .filter_map(|(k, v)| v.map(|v| (*k, v)))
+                .collect::<Vec<_>>()
+        };
+        let Some(id) = node else {
+            return self.build(&inserts(changes), depth);
+        };
+        match self.load(id)? {
+            Node::Empty => self.build(&inserts(changes), depth),
+            Node::Leaf { key, state } => {
+                let mut map: BTreeMap<ObjectId, ObjectStateId> = BTreeMap::from([(key, state)]);
+                for (k, v) in changes {
+                    match v {
+                        Some(v) => map.insert(*k, *v),
+                        None => map.remove(k),
+                    };
+                }
+                let entries: Vec<_> = map.into_iter().collect();
+                self.build(&entries, depth)
+            }
+            Node::Branch {
+                prefix_len,
+                prefix,
+                left,
+                right,
+            } => {
+                // A removal outside the branch's prefix removes nothing.
+                let changes: Vec<_> = changes
+                    .iter()
+                    .filter(|(k, v)| v.is_some() || mask_prefix(&k.0, prefix_len) == prefix)
+                    .copied()
+                    .collect();
+                if changes.is_empty() {
+                    return Ok(node);
+                }
+                // Where the first key leaves the branch's prefix, if any.
+                let split = changes
+                    .iter()
+                    .map(|(k, _)| common_prefix_len(&k.0, &prefix).min(prefix_len))
+                    .min()
+                    .unwrap_or(prefix_len)
+                    .max(depth);
+                if split == prefix_len {
+                    let mid = changes.partition_point(|(k, _)| !bit(&k.0, prefix_len));
+                    let l = self.apply(Some(left), &changes[..mid], prefix_len + 1)?;
+                    let r = self.apply(Some(right), &changes[mid..], prefix_len + 1)?;
+                    return self.join(prefix_len, prefix, l, r);
+                }
+                // Some new keys leave the prefix at bit `split`: the branch
+                // goes whole to its side of that bit, the others beside it.
+                let side = bit(&prefix, split);
+                let (with, apart): (Vec<_>, Vec<_>) = changes
+                    .into_iter()
+                    .partition(|(k, _)| bit(&k.0, split) == side);
+                let kept = self.apply(node, &with, split + 1)?;
+                let beside = self.build(&inserts(&apart), split + 1)?;
+                if side {
+                    self.join(split, prefix, beside, kept)
+                } else {
+                    self.join(split, prefix, kept, beside)
+                }
+            }
+        }
+    }
+}
+
 /// The empty tree's ID under `key`.
 pub fn empty_root<D: Digest>(digest: &D, key: &IdKey) -> Result<TreeId, DigestError> {
     Node::Empty.id(digest, key)
@@ -331,6 +511,51 @@ where
     Ok(out)
 }
 
+/// The state `object` has in the tree at `root`, reading only the nodes on
+/// its path, each checked against its ID. `None` when the tree does not
+/// hold it.
+pub fn lookup<D, F>(
+    digest: &D,
+    key: &IdKey,
+    root: TreeId,
+    object: &ObjectId,
+    mut fetch: F,
+) -> Result<Option<ObjectStateId>, TreeError>
+where
+    D: Digest,
+    F: FnMut(&TreeId) -> Option<Vec<u8>>,
+{
+    let mut id = root;
+    // A path has at most one branch per key bit, then a leaf.
+    for _ in 0..=KEY_BITS {
+        let bytes = fetch(&id).ok_or(TreeError::Missing(id))?;
+        let node = Node::decode(&bytes)?;
+        if node.id(digest, key)? != id {
+            return Err(TreeError::IdMismatch(id));
+        }
+        match node {
+            Node::Empty => return Ok(None),
+            Node::Leaf { key: k, state } => return Ok((k == *object).then_some(state)),
+            Node::Branch {
+                prefix_len,
+                prefix,
+                left,
+                right,
+            } => {
+                if mask_prefix(&object.0, prefix_len) != prefix {
+                    return Ok(None);
+                }
+                id = if bit(&object.0, prefix_len) {
+                    right
+                } else {
+                    left
+                };
+            }
+        }
+    }
+    Err(TreeError::Cycle(id))
+}
+
 /// Difference between two entry maps: what `after` adds, removes or changes
 /// relative to `before`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -358,6 +583,165 @@ pub fn diff(
         }
     }
     d
+}
+
+/// The difference between the trees at `before` and `after`, reading only
+/// where they differ: a subtree with the same ID at the same place is the
+/// same on both sides and is skipped. Every node read is checked against
+/// its ID. The lists are sorted by object ID.
+pub fn diff_trees<D, F>(
+    digest: &D,
+    key: &IdKey,
+    before: TreeId,
+    after: TreeId,
+    fetch: F,
+) -> Result<TreeDiff, TreeError>
+where
+    D: Digest,
+    F: FnMut(&TreeId) -> Option<Vec<u8>>,
+{
+    let mut differ = TreeDiffer {
+        digest,
+        key,
+        fetch,
+        out: TreeDiff::default(),
+    };
+    differ.nodes(before, after)?;
+    let mut out = differ.out;
+    out.added.sort();
+    out.removed.sort();
+    out.changed.sort();
+    Ok(out)
+}
+
+struct TreeDiffer<'a, D, F> {
+    digest: &'a D,
+    key: &'a IdKey,
+    fetch: F,
+    out: TreeDiff,
+}
+
+impl<D, F> TreeDiffer<'_, D, F>
+where
+    D: Digest,
+    F: FnMut(&TreeId) -> Option<Vec<u8>>,
+{
+    fn load(&mut self, id: TreeId) -> Result<Node, TreeError> {
+        let bytes = (self.fetch)(&id).ok_or(TreeError::Missing(id))?;
+        let node = Node::decode(&bytes)?;
+        if node.id(self.digest, self.key)? != id {
+            return Err(TreeError::IdMismatch(id));
+        }
+        Ok(node)
+    }
+
+    fn entries(&mut self, id: TreeId) -> Result<BTreeMap<ObjectId, ObjectStateId>, TreeError> {
+        walk_verified(self.digest, self.key, id, &mut self.fetch)
+    }
+
+    fn removed(&mut self, id: TreeId) -> Result<(), TreeError> {
+        let entries = self.entries(id)?;
+        self.out.removed.extend(entries);
+        Ok(())
+    }
+
+    fn added(&mut self, id: TreeId) -> Result<(), TreeError> {
+        let entries = self.entries(id)?;
+        self.out.added.extend(entries);
+        Ok(())
+    }
+
+    /// A single entry on one side against a whole subtree on the other.
+    fn leaf_against(
+        &mut self,
+        k: ObjectId,
+        s: ObjectStateId,
+        tree: TreeId,
+        leaf_before: bool,
+    ) -> Result<(), TreeError> {
+        let mut entries = self.entries(tree)?;
+        match entries.remove(&k) {
+            Some(other) if other != s => self.out.changed.push(if leaf_before {
+                (k, s, other)
+            } else {
+                (k, other, s)
+            }),
+            Some(_) => {}
+            None if leaf_before => self.out.removed.push((k, s)),
+            None => self.out.added.push((k, s)),
+        }
+        if leaf_before {
+            self.out.added.extend(entries);
+        } else {
+            self.out.removed.extend(entries);
+        }
+        Ok(())
+    }
+
+    fn nodes(&mut self, a: TreeId, b: TreeId) -> Result<(), TreeError> {
+        if a == b {
+            return Ok(());
+        }
+        match (self.load(a)?, self.load(b)?) {
+            (Node::Empty, _) => self.added(b),
+            (_, Node::Empty) => self.removed(a),
+            (Node::Leaf { key: ka, state: sa }, Node::Leaf { key: kb, state: sb }) => {
+                if ka == kb {
+                    self.out.changed.push((ka, sa, sb));
+                } else {
+                    self.out.removed.push((ka, sa));
+                    self.out.added.push((kb, sb));
+                }
+                Ok(())
+            }
+            (Node::Leaf { key, state }, Node::Branch { .. }) => {
+                self.leaf_against(key, state, b, true)
+            }
+            (Node::Branch { .. }, Node::Leaf { key, state }) => {
+                self.leaf_against(key, state, a, false)
+            }
+            (
+                Node::Branch {
+                    prefix_len: la,
+                    prefix: pa,
+                    left: a_left,
+                    right: a_right,
+                },
+                Node::Branch {
+                    prefix_len: lb,
+                    prefix: pb,
+                    left: b_left,
+                    right: b_right,
+                },
+            ) => {
+                if la == lb && pa == pb {
+                    self.nodes(a_left, b_left)?;
+                    self.nodes(a_right, b_right)
+                } else if la < lb && mask_prefix(&pb, la) == pa {
+                    // Everything after holds lies under one child before.
+                    if bit(&pb, la) {
+                        self.removed(a_left)?;
+                        self.nodes(a_right, b)
+                    } else {
+                        self.nodes(a_left, b)?;
+                        self.removed(a_right)
+                    }
+                } else if lb < la && mask_prefix(&pa, lb) == pb {
+                    if bit(&pa, lb) {
+                        self.added(b_left)?;
+                        self.nodes(a, b_right)
+                    } else {
+                        self.nodes(a, b_left)?;
+                        self.added(b_right)
+                    }
+                } else {
+                    // Disjoint key ranges.
+                    self.removed(a)?;
+                    self.added(b)
+                }
+            }
+        }
+    }
 }
 
 /// In-memory node store for tests and small trees.
@@ -419,6 +803,216 @@ mod tests {
         let d = diff(&e, &e2);
         assert_eq!(d.changed.len(), 1);
         assert!(d.added.is_empty() && d.removed.is_empty());
+    }
+
+    /// Pseudo-random maps, to compare the walking diff with the map diff.
+    fn random_entries(seed: u64, n: usize) -> BTreeMap<ObjectId, ObjectStateId> {
+        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        (0..n)
+            .map(|_| {
+                let mut k = [0u8; 16];
+                k[..8].copy_from_slice(&next().to_le_bytes());
+                // Few distinct high bytes, so trees share long prefixes.
+                k[0] &= 0x0f;
+                let mut st = [0u8; 32];
+                st[..8].copy_from_slice(&next().to_le_bytes());
+                (ObjectId(k), ObjectStateId(st))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn walking_diff_matches_the_map_diff() {
+        for seed in 0..40u64 {
+            let a = random_entries(seed, (seed as usize * 7) % 60);
+            let mut b = a.clone();
+            let changes = random_entries(seed + 1000, 1 + seed as usize % 9);
+            for (i, (k, v)) in changes.into_iter().enumerate() {
+                match i % 3 {
+                    0 => {
+                        b.insert(k, v);
+                    }
+                    1 => {
+                        if let Some(first) = b.keys().nth(i).copied() {
+                            b.remove(&first);
+                        }
+                    }
+                    _ => {
+                        if let Some(first) = b.keys().nth(i).copied() {
+                            b.insert(first, v);
+                        }
+                    }
+                }
+            }
+            let ta = build(&RustDigest, &key(), &a).unwrap();
+            let tb = build(&RustDigest, &key(), &b).unwrap();
+            let mut store = store_of(&ta);
+            store.extend(store_of(&tb));
+            let walked = diff_trees(&RustDigest, &key(), ta.root, tb.root, |id| {
+                store.get(id).cloned()
+            })
+            .unwrap();
+            assert_eq!(walked, diff(&a, &b), "seed {seed}");
+            let back = diff_trees(&RustDigest, &key(), tb.root, ta.root, |id| {
+                store.get(id).cloned()
+            })
+            .unwrap();
+            assert_eq!(back, diff(&b, &a), "seed {seed} reversed");
+        }
+    }
+
+    #[test]
+    fn update_gives_the_tree_build_gives() {
+        for seed in 0..60u64 {
+            let a = random_entries(seed, (seed as usize * 11) % 80);
+            let mut changes: BTreeMap<ObjectId, Option<ObjectStateId>> = BTreeMap::new();
+            for (i, (k, v)) in random_entries(seed + 500, 1 + seed as usize % 12)
+                .into_iter()
+                .enumerate()
+            {
+                match i % 4 {
+                    // New keys, removals of present and absent keys, edits.
+                    0 => {
+                        changes.insert(k, Some(v));
+                    }
+                    1 => {
+                        if let Some(present) = a.keys().nth(i * 3) {
+                            changes.insert(*present, None);
+                        }
+                    }
+                    2 => {
+                        changes.insert(k, None);
+                    }
+                    _ => {
+                        if let Some(present) = a.keys().nth(i) {
+                            changes.insert(*present, Some(v));
+                        }
+                    }
+                }
+            }
+            // Sometimes everything goes.
+            if seed % 13 == 0 {
+                changes.extend(a.keys().map(|k| (*k, None)));
+            }
+            let mut b = a.clone();
+            for (k, v) in &changes {
+                match v {
+                    Some(v) => b.insert(*k, *v),
+                    None => b.remove(k),
+                };
+            }
+            let ta = build(&RustDigest, &key(), &a).unwrap();
+            let store = store_of(&ta);
+            let updated = update(&RustDigest, &key(), ta.root, &changes, |id| {
+                store.get(id).cloned()
+            })
+            .unwrap();
+            let expected = build(&RustDigest, &key(), &b).unwrap();
+            assert_eq!(updated.root, expected.root, "seed {seed}");
+            // Every node the new tree needs is old or created.
+            let mut all = store.clone();
+            all.extend(store_of(&updated));
+            let back = walk_verified(&RustDigest, &key(), updated.root, |id| all.get(id).cloned())
+                .unwrap();
+            assert_eq!(back, b, "seed {seed}");
+        }
+    }
+
+    #[test]
+    fn update_places_keys_that_leave_a_long_shared_prefix() {
+        // Sequential IDs share their high bits; random ones leave them at
+        // every depth.
+        let seq = |i: u64| {
+            let mut k = [0u8; 16];
+            k[..8].copy_from_slice(&i.to_be_bytes());
+            ObjectId(k)
+        };
+        for seed in 0..30u64 {
+            let a: BTreeMap<_, _> = (1..=(20 + seed * 5))
+                .map(|i| (seq(i), ObjectStateId([i as u8; 32])))
+                .collect();
+            let mut changes: BTreeMap<_, _> = random_entries(seed, 1 + seed as usize % 6)
+                .into_iter()
+                .map(|(k, v)| (k, Some(v)))
+                .collect();
+            changes.insert(seq(1000 + seed), Some(ObjectStateId([1; 32])));
+            changes.insert(seq(3), None);
+            let mut b = a.clone();
+            for (k, v) in &changes {
+                match v {
+                    Some(v) => b.insert(*k, *v),
+                    None => b.remove(k),
+                };
+            }
+            let ta = build(&RustDigest, &key(), &a).unwrap();
+            let store = store_of(&ta);
+            let updated = update(&RustDigest, &key(), ta.root, &changes, |id| {
+                store.get(id).cloned()
+            })
+            .unwrap();
+            assert_eq!(
+                updated.root,
+                build(&RustDigest, &key(), &b).unwrap().root,
+                "seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn update_touches_only_the_changed_path() {
+        let e = random_entries(7, 2000);
+        let t = build(&RustDigest, &key(), &e).unwrap();
+        let store = store_of(&t);
+        let k = *e.keys().nth(1234).unwrap();
+        let changes = BTreeMap::from([(k, Some(ObjectStateId([9; 32])))]);
+        let mut reads = 0;
+        let updated = update(&RustDigest, &key(), t.root, &changes, |id| {
+            reads += 1;
+            store.get(id).cloned()
+        })
+        .unwrap();
+        assert!(reads < 40, "{reads} reads");
+        assert!(updated.nodes.len() < 40, "{} nodes", updated.nodes.len());
+    }
+
+    #[test]
+    fn lookup_reads_one_path() {
+        let e = entries(50);
+        let t = build(&RustDigest, &key(), &e).unwrap();
+        let store = store_of(&t);
+        let mut reads = 0;
+        for (k, v) in &e {
+            let found = lookup(&RustDigest, &key(), t.root, k, |id| {
+                reads += 1;
+                store.get(id).cloned()
+            })
+            .unwrap();
+            assert_eq!(found, Some(*v));
+        }
+        assert!(reads < e.len() * 10, "{reads} reads");
+        let absent = ObjectId([0xAB; 16]);
+        assert_eq!(
+            lookup(&RustDigest, &key(), t.root, &absent, |id| store
+                .get(id)
+                .cloned())
+            .unwrap(),
+            None
+        );
+        let empty = build(&RustDigest, &key(), &BTreeMap::new()).unwrap();
+        let store = store_of(&empty);
+        assert_eq!(
+            lookup(&RustDigest, &key(), empty.root, &absent, |id| store
+                .get(id)
+                .cloned())
+            .unwrap(),
+            None
+        );
     }
 
     #[test]

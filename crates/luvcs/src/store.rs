@@ -297,6 +297,7 @@ CREATE TABLE IF NOT EXISTS vcs_operations (
   undone INTEGER NOT NULL DEFAULT 0
 ) STRICT;
 CREATE UNIQUE INDEX IF NOT EXISTS vcs_operations_id ON vcs_operations (repo_id, operation_id);
+CREATE INDEX IF NOT EXISTS vcs_operations_undone ON vcs_operations (repo_id, undone, seq);
 CREATE TABLE IF NOT EXISTS vcs_redacted (
   repo_id BLOB NOT NULL,
   kind TEXT NOT NULL,
@@ -616,6 +617,52 @@ impl Reader<'_> {
         Ok(entries?)
     }
 
+    fn tree_lookup<D: Digest>(
+        &self,
+        digest: &D,
+        key: &IdKey,
+        root: TreeId,
+        object: ObjectId,
+    ) -> Result<Option<ObjectStateId>> {
+        let mut err = None;
+        let found = tree::lookup(digest, key, root, &object, |id| {
+            match self.object(KIND_TREE, id.as_bytes()) {
+                Ok(v) => v,
+                Err(e) => {
+                    err = Some(e);
+                    None
+                }
+            }
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+        Ok(found?)
+    }
+
+    fn tree_diff<D: Digest>(
+        &self,
+        digest: &D,
+        key: &IdKey,
+        before: TreeId,
+        after: TreeId,
+    ) -> Result<tree::TreeDiff> {
+        let mut err = None;
+        let diff = tree::diff_trees(digest, key, before, after, |id| {
+            match self.object(KIND_TREE, id.as_bytes()) {
+                Ok(v) => v,
+                Err(e) => {
+                    err = Some(e);
+                    None
+                }
+            }
+        });
+        if let Some(e) = err {
+            return Err(e);
+        }
+        Ok(diff?)
+    }
+
     fn visible(&self) -> Result<BTreeSet<CommitId>> {
         let mut stmt = self
             .conn
@@ -671,13 +718,14 @@ impl<D: Digest> Repo<'_, '_, D> {
 
     // ----- immutable objects ------------------------------------------------
 
+    /// Stores an immutable object; `true` when it was not there before.
     fn put_object_tx(
         tx: &Transaction<'_>,
         repo: &[u8],
         kind: &str,
         id: &[u8],
         bytes: &[u8],
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let existing: Option<Vec<u8>> = tx
             .query_row(
                 "SELECT bytes FROM vcs_objects WHERE repo_id = ?1 AND kind = ?2 AND logical_id = ?3",
@@ -686,7 +734,7 @@ impl<D: Digest> Repo<'_, '_, D> {
             )
             .optional()?;
         match existing {
-            Some(old) if old == bytes => Ok(()),
+            Some(old) if old == bytes => Ok(false),
             Some(_) => Err(StoreError::IdentityConflict {
                 id: format!("{kind}:{}", hex::encode(id)),
             }),
@@ -695,7 +743,7 @@ impl<D: Digest> Repo<'_, '_, D> {
                     "INSERT INTO vcs_objects (repo_id, kind, logical_id, bytes) VALUES (?1, ?2, ?3, ?4)",
                     params![repo, kind, id, bytes],
                 )?;
-                Ok(())
+                Ok(true)
             }
         }
     }
@@ -801,6 +849,26 @@ impl<D: Digest> Repo<'_, '_, D> {
             .tree_entries(&self.store.digest, &self.key, root)
     }
 
+    /// The state `object` has in the tree at `root`, reading only its path.
+    pub fn lookup(&self, root: TreeId, object: ObjectId) -> Result<Option<ObjectStateId>> {
+        self.reader()
+            .tree_lookup(&self.store.digest, &self.key, root, object)
+    }
+
+    /// What changes from the tree at `before` (`None`: empty) to the one at
+    /// `after`, reading only the parts that differ.
+    pub fn diff(&self, before: Option<TreeId>, after: TreeId) -> Result<tree::TreeDiff> {
+        match before {
+            Some(before) => self
+                .reader()
+                .tree_diff(&self.store.digest, &self.key, before, after),
+            None => Ok(tree::TreeDiff {
+                added: self.tree_entries(after)?.into_iter().collect(),
+                ..tree::TreeDiff::default()
+            }),
+        }
+    }
+
     /// Entries of a commit's snapshot.
     pub fn snapshot(&self, id: CommitId) -> Result<BTreeMap<ObjectId, ObjectStateId>> {
         let c = self.commit(id)?;
@@ -863,16 +931,13 @@ impl<D: Digest> Repo<'_, '_, D> {
                 break;
             }
             let commit = reader.commit(id, &self.store.caps)?;
-            let entries = reader.tree_entries(&self.store.digest, &self.key, commit.root)?;
-            let state = entries.get(&object_id).copied();
+            let state =
+                reader.tree_lookup(&self.store.digest, &self.key, commit.root, object_id)?;
             let parent = commit.parents.first().copied();
             let parent_state = match parent {
                 Some(p) => {
                     let pc = reader.commit(p, &self.store.caps)?;
-                    reader
-                        .tree_entries(&self.store.digest, &self.key, pc.root)?
-                        .get(&object_id)
-                        .copied()
+                    reader.tree_lookup(&self.store.digest, &self.key, pc.root, object_id)?
                 }
                 None => None,
             };
@@ -1004,14 +1069,20 @@ impl<D: Digest> Repo<'_, '_, D> {
             bookmark_writes,
             ..
         } = exec;
-        for (ordinal, (kind_, id, bytes)) in pending.objects.iter().enumerate() {
-            Self::put_object_tx(&tx, repo.as_bytes(), kind_, id, bytes)?;
+        // The log names what this operation added to the store; objects it
+        // only reused (most of a rebuilt tree) were added by an earlier one.
+        let mut ordinal = 0i64;
+        for (kind_, id, bytes) in &pending.objects {
+            if !Self::put_object_tx(&tx, repo.as_bytes(), kind_, id, bytes)? {
+                continue;
+            }
             if *kind_ == KIND_BOOKMARK_UPDATE {
                 bookmarks::index_tx(&tx, repo, id, bytes, &caps)?;
             }
+            ordinal += 1;
             tx.execute(
                 "INSERT INTO vcs_operation_objects (repo_id, operation_id, ordinal, kind, logical_id) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![repo.as_bytes(), ctx.operation_id.to_vec(), ordinal as i64, kind_, id],
+                params![repo.as_bytes(), ctx.operation_id.to_vec(), ordinal, kind_, id],
             )?;
         }
         for c in &visible_removed {
@@ -1096,26 +1167,21 @@ impl<D: Digest> Repo<'_, '_, D> {
         changes: &[WorkingChange],
     ) -> Result<Workspace> {
         self.operate(ctx, "save_working", |exec, ws| {
-            let mut entries = exec.tree_entries(ws.working)?;
+            let mut edits = BTreeMap::new();
             for (object_id, state) in changes {
-                match state {
-                    Some(s) => {
-                        // The state must exist and belong to this object.
-                        let st = exec.state(*s)?;
-                        if st.object_id != *object_id {
-                            return Err(StoreError::Invalid(format!(
-                                "state {s} belongs to {}, not {object_id}",
-                                st.object_id
-                            )));
-                        }
-                        entries.insert(*object_id, *s);
-                    }
-                    None => {
-                        entries.remove(object_id);
+                if let Some(s) = state {
+                    // The state must exist and belong to this object.
+                    let st = exec.state(*s)?;
+                    if st.object_id != *object_id {
+                        return Err(StoreError::Invalid(format!(
+                            "state {s} belongs to {}, not {object_id}",
+                            st.object_id
+                        )));
                     }
                 }
+                edits.insert(*object_id, *state);
             }
-            let root = exec.put_tree(&entries)?;
+            let root = exec.update_tree(ws.working, &edits)?;
             let mut after = ws.clone();
             after.working = root;
             Ok((after, ()))
@@ -1131,22 +1197,15 @@ impl<D: Digest> Repo<'_, '_, D> {
         objects: &[ObjectId],
     ) -> Result<Workspace> {
         self.operate(ctx, "select_candidate", |exec, ws| {
-            let working = exec.tree_entries(ws.working)?;
-            let mut candidate = match ws.base {
-                Some(b) => exec.tree_entries(exec.commit(b)?.root)?,
-                None => BTreeMap::new(),
+            let base = match ws.base {
+                Some(b) => exec.commit(b)?.root,
+                None => exec.put_tree(&BTreeMap::new())?,
             };
+            let mut edits = BTreeMap::new();
             for id in objects {
-                match working.get(id) {
-                    Some(s) => {
-                        candidate.insert(*id, *s);
-                    }
-                    None => {
-                        candidate.remove(id);
-                    }
-                }
+                edits.insert(*id, exec.lookup(ws.working, *id)?);
             }
-            let root = exec.put_tree(&candidate)?;
+            let root = exec.update_tree(base, &edits)?;
             let mut after = ws.clone();
             after.candidate = Some(root);
             Ok((after, ()))
@@ -1249,41 +1308,62 @@ impl<D: Digest> Repo<'_, '_, D> {
                 return Err(StoreError::UnrecordedChanges);
             }
             let ancestors = exec.merge_bases(base, other)?;
-            let left = exec.tree_entries(exec.commit(base)?.root)?;
-            let right = exec.tree_entries(exec.commit(other)?.root)?;
-            let ancestor_entries: Vec<BTreeMap<ObjectId, ObjectStateId>> = ancestors
+            let left = exec.commit(base)?.root;
+            let right = exec.commit(other)?.root;
+            let ancestor_roots: Vec<TreeId> = ancestors
                 .iter()
-                .map(|a| exec.tree_entries(exec.commit(*a)?.root))
+                .map(|a| Ok(exec.commit(*a)?.root))
                 .collect::<Result<_>>()?;
-            let mut merged = BTreeMap::new();
+            // Only an object some side changed against some merge base can
+            // merge to anything but the left state; the result is the left
+            // tree with those objects updated. Unrelated histories (no base)
+            // look at every object.
+            let mut keys: BTreeSet<ObjectId> = BTreeSet::new();
+            if ancestor_roots.is_empty() {
+                keys.extend(exec.tree_entries(left)?.into_keys());
+                keys.extend(exec.tree_entries(right)?.into_keys());
+            } else {
+                for a in &ancestor_roots {
+                    let sides: &[TreeId] = if ancestor_roots.len() == 1 {
+                        &[right]
+                    } else {
+                        &[left, right]
+                    };
+                    for side in sides {
+                        let d = exec.diff(*a, *side)?;
+                        keys.extend(d.added.iter().map(|(k, _)| *k));
+                        keys.extend(d.removed.iter().map(|(k, _)| *k));
+                        keys.extend(d.changed.iter().map(|(k, _, _)| *k));
+                    }
+                }
+            }
+            let mut edits = BTreeMap::new();
             let mut conflicts = Vec::new();
-            let keys: BTreeSet<ObjectId> = left.keys().chain(right.keys()).copied().collect();
             for object_id in keys {
-                let l = left.get(&object_id).copied();
-                let r = right.get(&object_id).copied();
+                let l = exec.lookup(left, object_id)?;
+                let r = exec.lookup(right, object_id)?;
                 // Base candidates for this object across all merge bases.
-                let bases: BTreeSet<Option<ObjectStateId>> = ancestor_entries
-                    .iter()
-                    .map(|e| e.get(&object_id).copied())
-                    .collect();
+                let mut bases: BTreeSet<Option<ObjectStateId>> = BTreeSet::new();
+                for a in &ancestor_roots {
+                    bases.insert(exec.lookup(*a, object_id)?);
+                }
                 let base_state = if bases.len() == 1 {
                     Some(bases.into_iter().next().unwrap())
                 } else {
                     None // no ancestor at all, or ambiguous
                 };
-                let outcome = exec.merge_object(object_id, base_state, l, r, &ancestors)?;
-                match outcome {
-                    ObjectMerge::Keep(Some(s)) => {
-                        merged.insert(object_id, s);
-                    }
-                    ObjectMerge::Keep(None) => {}
+                let merged = match exec.merge_object(object_id, base_state, l, r, &ancestors)? {
+                    ObjectMerge::Keep(s) => s,
                     ObjectMerge::Conflict(state, conflict_id) => {
-                        merged.insert(object_id, state);
                         conflicts.push((object_id, conflict_id));
+                        Some(state)
                     }
+                };
+                if merged != l {
+                    edits.insert(object_id, merged);
                 }
             }
-            let root = exec.put_tree(&merged)?;
+            let root = exec.update_tree(left, &edits)?;
             let commit = exec.new_commit(
                 ChangeId(exec.fresh_id(ctx, "integrate")?),
                 vec![base, other],
@@ -1320,8 +1400,7 @@ impl<D: Digest> Repo<'_, '_, D> {
         resolved: ObjectStateId,
     ) -> Result<Workspace> {
         self.operate(ctx, "resolve", |exec, ws| {
-            let mut entries = exec.tree_entries(ws.working)?;
-            let current = entries.get(&object_id).copied().ok_or_else(|| {
+            let current = exec.lookup(ws.working, object_id)?.ok_or_else(|| {
                 StoreError::Invalid(format!("{object_id} is not in the working tree"))
             })?;
             let state = exec.state(current)?;
@@ -1341,8 +1420,8 @@ impl<D: Digest> Repo<'_, '_, D> {
                     "resolved state is itself a conflict".into(),
                 ));
             }
-            entries.insert(object_id, resolved);
-            let root = exec.put_tree(&entries)?;
+            let root =
+                exec.update_tree(ws.working, &BTreeMap::from([(object_id, Some(resolved))]))?;
             let mut after = ws.clone();
             after.working = root;
             Ok((after, ()))
@@ -1359,17 +1438,8 @@ impl<D: Digest> Repo<'_, '_, D> {
         object_id: ObjectId,
     ) -> Result<Workspace> {
         self.operate(ctx, "restore", |exec, ws| {
-            let source = exec.tree_entries(exec.commit(commit)?.root)?;
-            let mut entries = exec.tree_entries(ws.working)?;
-            match source.get(&object_id) {
-                Some(s) => {
-                    entries.insert(object_id, *s);
-                }
-                None => {
-                    entries.remove(&object_id);
-                }
-            }
-            let root = exec.put_tree(&entries)?;
+            let source = exec.lookup(exec.commit(commit)?.root, object_id)?;
+            let root = exec.update_tree(ws.working, &BTreeMap::from([(object_id, source)]))?;
             let mut after = ws.clone();
             after.working = root;
             Ok((after, ()))
@@ -1528,6 +1598,18 @@ impl<D: Digest> Repo<'_, '_, D> {
             params![repo.as_bytes(), ws.id.to_vec(), cbor::encode(&ws.to_cbor())],
         )?;
         Ok(())
+    }
+
+    /// Whether there is an operation to undo, and one to redo.
+    pub fn can_undo_redo(&self) -> Result<(bool, bool)> {
+        let any = |undone: i64| -> Result<bool> {
+            Ok(self.store.conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM vcs_operations WHERE repo_id = ?1 AND undone = ?2)",
+                params![self.repo_id.as_bytes(), undone],
+                |r| r.get(0),
+            )?)
+        };
+        Ok((any(0)?, any(1)?))
     }
 
     pub fn operations(&self, limit: usize) -> Result<Vec<OperationEntry>> {
@@ -1905,6 +1987,58 @@ impl<D: Digest> Executor<'_, '_, D> {
         Ok(entries?)
     }
 
+    /// Runs `f` with a node fetcher that sees this operation's writes.
+    fn with_nodes<T, E>(
+        &self,
+        f: impl FnOnce(&mut dyn FnMut(&TreeId) -> Option<Vec<u8>>) -> std::result::Result<T, E>,
+    ) -> Result<T>
+    where
+        StoreError: From<E>,
+    {
+        let mut err = None;
+        let out = f(
+            &mut |id: &TreeId| match self.object(KIND_TREE, id.as_bytes()) {
+                Ok(v) => v,
+                Err(e) => {
+                    err = Some(e);
+                    None
+                }
+            },
+        );
+        if let Some(e) = err {
+            return Err(e);
+        }
+        Ok(out?)
+    }
+
+    fn lookup(&self, root: TreeId, object: ObjectId) -> Result<Option<ObjectStateId>> {
+        self.with_nodes(|fetch| tree::lookup(self.digest, self.key, root, &object, fetch))
+    }
+
+    fn diff(&self, before: TreeId, after: TreeId) -> Result<tree::TreeDiff> {
+        self.with_nodes(|fetch| tree::diff_trees(self.digest, self.key, before, after, fetch))
+    }
+
+    /// The tree at `root` with `changes` applied, writing only the nodes on
+    /// the changed paths.
+    fn update_tree(
+        &mut self,
+        root: TreeId,
+        changes: &BTreeMap<ObjectId, Option<ObjectStateId>>,
+    ) -> Result<TreeId> {
+        if changes.is_empty() {
+            return Ok(root);
+        }
+        let built =
+            self.with_nodes(|fetch| tree::update(self.digest, self.key, root, changes, fetch))?;
+        for (id, node) in built.nodes {
+            self.pending
+                .objects
+                .push((KIND_TREE, id.to_vec(), node.encode()));
+        }
+        Ok(built.root)
+    }
+
     fn put_tree(&mut self, entries: &BTreeMap<ObjectId, ObjectStateId>) -> Result<TreeId> {
         let built = tree::build(self.digest, self.key, entries)?;
         for (id, node) in &built.nodes {
@@ -2109,9 +2243,8 @@ impl<D: Digest> Executor<'_, '_, D> {
                 // Ambiguous or absent base: record every candidate base state.
                 let mut v = Vec::new();
                 for a in ancestors {
-                    let entries = self.tree_entries(self.commit(*a)?.root)?;
-                    if let Some(s) = entries.get(&object_id) {
-                        v.push(*s);
+                    if let Some(s) = self.lookup(self.commit(*a)?.root, object_id)? {
+                        v.push(s);
                     }
                 }
                 v.sort();

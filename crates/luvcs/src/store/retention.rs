@@ -409,10 +409,9 @@ impl<D: Digest> Repo<'_, '_, D> {
             }
         }
         for (place, root) in &trees {
-            let entries = reader.tree_entries(&self.store.digest, &self.key, *root)?;
             for o in &targets {
-                if let Some(s) = entries.get(o)
-                    && !matches!(reader.state(*s, &caps)?.body, ObjectBody::Deleted)
+                if let Some(s) = reader.tree_lookup(&self.store.digest, &self.key, *root, *o)?
+                    && !matches!(reader.state(s, &caps)?.body, ObjectBody::Deleted)
                 {
                     return Err(StoreError::Invalid(format!(
                         "{o} is not deleted in {place}; delete it and record before purging"

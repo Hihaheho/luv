@@ -782,12 +782,11 @@ impl<D: Digest> Session<'_, '_, '_, D> {
 
     fn commit_view(&self, id: CommitId, heads: &[CommitId]) -> ApiResult<VcsCommitView> {
         let c = self.repo.commit(id)?;
-        let after = self.repo.tree_entries(c.root)?;
         let before = match c.parents.first() {
-            Some(p) => self.repo.snapshot(*p)?,
-            None => BTreeMap::new(),
+            Some(p) => Some(self.repo.commit(*p)?.root),
+            None => None,
         };
-        let diff = crate::tree::diff(&before, &after);
+        let diff = self.repo.diff(before, c.root)?;
         let mut changed: Vec<String> = diff
             .added
             .iter()
@@ -811,12 +810,12 @@ impl<D: Digest> Session<'_, '_, '_, D> {
 
     fn status(&mut self) -> ApiResult<VcsStatus> {
         let ws = self.workspace()?;
-        let working = self.repo.tree_entries(ws.working)?;
         let mut changes = Vec::new();
         for (object_id, kind) in working_changes(self.repo, &ws)? {
-            let state = working
-                .get(&object_id)
-                .map(|s| self.repo.get_state(*s))
+            let state = self
+                .repo
+                .lookup(ws.working, object_id)?
+                .map(|s| self.repo.get_state(s))
                 .transpose()?;
             changes.push(VcsChange {
                 object_id: object_id.to_string(),
@@ -833,14 +832,25 @@ impl<D: Digest> Session<'_, '_, '_, D> {
             });
         }
         // Conflicts are a property of the working tree, not of the diff: an
-        // integrate leaves them in the tree with nothing "changed" yet.
+        // integrate leaves them in the tree with nothing "changed" yet. Only
+        // an object some stored conflict is about can hold one, so those are
+        // looked up instead of reading every state of the tree.
+        let mut conflicted = std::collections::BTreeSet::new();
+        for id in self.repo.object_ids("conflict")? {
+            let id = crate::id::ConflictId::from_bytes(&id)
+                .map_err(|e| VcsError::new(VcsErrorCode::Internal, e.to_string()))?;
+            conflicted.insert(self.repo.get_conflict(id)?.object_id);
+        }
         let mut conflicts = Vec::new();
-        for (object_id, state_id) in &working {
-            if let ObjectBody::Conflict { conflict } = self.repo.get_state(*state_id)?.body {
-                conflicts.push(self.conflict_view(*object_id, conflict)?);
+        for object_id in conflicted {
+            let Some(state_id) = self.repo.lookup(ws.working, object_id)? else {
+                continue;
+            };
+            if let ObjectBody::Conflict { conflict } = self.repo.get_state(state_id)?.body {
+                conflicts.push(self.conflict_view(object_id, conflict)?);
             }
         }
-        let ops = self.repo.operations(usize::MAX / 2)?;
+        let (can_undo, can_redo) = self.repo.can_undo_redo()?;
         Ok(VcsStatus {
             repo_id: self.local.repo_id.to_string(),
             workspace_id: self.local.workspace_id.to_string(),
@@ -854,8 +864,8 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
-            can_undo: ops.iter().any(|o| !o.undone),
-            can_redo: ops.iter().any(|o| o.undone),
+            can_undo,
+            can_redo,
         })
     }
 
@@ -871,16 +881,30 @@ impl<D: Digest> Session<'_, '_, '_, D> {
         Ok(object_id)
     }
 
+    /// The tree of `commit_id`, or of the working tree.
+    fn root_at(&mut self, commit_id: Option<&str>) -> ApiResult<crate::id::TreeId> {
+        Ok(match commit_id {
+            Some(c) => self.repo.commit(parse("commit id", c)?)?.root,
+            None => self.workspace()?.working,
+        })
+    }
+
     fn entries_at(
         &mut self,
         commit_id: Option<&str>,
     ) -> ApiResult<BTreeMap<ObjectId, ObjectStateId>> {
-        Ok(match commit_id {
-            Some(c) => self.repo.snapshot(parse("commit id", c)?)?,
-            None => {
-                let ws = self.workspace()?;
-                self.repo.tree_entries(ws.working)?
-            }
+        let root = self.root_at(commit_id)?;
+        Ok(self.repo.tree_entries(root)?)
+    }
+
+    /// The working state of `id`, which must be in the working tree.
+    fn working_state(&mut self, id: ObjectId) -> ApiResult<ObjectStateId> {
+        let ws = self.workspace()?;
+        self.repo.lookup(ws.working, id)?.ok_or_else(|| {
+            VcsError::new(
+                VcsErrorCode::NotFound,
+                format!("object {id} is not in the working tree"),
+            )
         })
     }
 
@@ -1032,14 +1056,7 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                 object_id, title, ..
             } => {
                 let id: ObjectId = parse("object id", &object_id)?;
-                let ws = self.workspace()?;
-                let working = self.repo.tree_entries(ws.working)?;
-                let current = working.get(&id).copied().ok_or_else(|| {
-                    VcsError::new(
-                        VcsErrorCode::NotFound,
-                        format!("object {id} is not in the working tree"),
-                    )
-                })?;
+                let current = self.working_state(id)?;
                 let mut state = self.repo.get_state(current)?;
                 match state.body {
                     ObjectBody::Deleted => {
@@ -1081,8 +1098,8 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                 ..
             } => {
                 let id: ObjectId = parse("object id", &object_id)?;
-                let entries = self.entries_at(commit_id.as_deref())?;
-                let state = entries.get(&id).copied().ok_or_else(|| {
+                let root = self.root_at(commit_id.as_deref())?;
+                let state = self.repo.lookup(root, id)?.ok_or_else(|| {
                     VcsError::new(
                         VcsErrorCode::NotFound,
                         format!("object {id} is not in this snapshot"),
@@ -1170,14 +1187,7 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                 ..
             } => {
                 let id: ObjectId = parse("object id", &object_id)?;
-                let ws = self.workspace()?;
-                let working = self.repo.tree_entries(ws.working)?;
-                let current = working.get(&id).copied().ok_or_else(|| {
-                    VcsError::new(
-                        VcsErrorCode::NotFound,
-                        format!("object {id} is not in the working tree"),
-                    )
-                })?;
+                let current = self.working_state(id)?;
                 let state = self.repo.get_state(current)?;
                 let ObjectBody::Conflict { conflict } = state.body else {
                     return Err(VcsError::invalid(format!("object {id} is not in conflict")));
@@ -1652,12 +1662,11 @@ fn working_changes<D: Digest>(
     repo: &Repo<'_, '_, D>,
     workspace: &Workspace,
 ) -> Result<Vec<(ObjectId, &'static str)>, StoreError> {
-    let working = repo.tree_entries(workspace.working)?;
     let base = match workspace.base {
-        Some(c) => repo.snapshot(c)?,
-        None => Default::default(),
+        Some(c) => Some(repo.commit(c)?.root),
+        None => None,
     };
-    let diff = crate::tree::diff(&base, &working);
+    let diff = repo.diff(base, workspace.working)?;
     let mut out: Vec<(ObjectId, &'static str)> = diff
         .added
         .iter()
