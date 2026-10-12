@@ -29,6 +29,8 @@ use crate::store::{
     Store, StoreError, Workspace,
 };
 
+mod terms;
+
 /// What a host provides for one call.
 pub struct HostContext<'a> {
     pub digest: &'a dyn Digest,
@@ -1215,6 +1217,28 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                     Ok(Value::Map(entries))
                 };
                 let resolved = match resolution {
+                    VcsResolution::Terms {
+                        conflict_id,
+                        choices,
+                    } => {
+                        let ObjectBody::Conflict { conflict: current } = state.body else {
+                            unreachable!("checked above");
+                        };
+                        if parse::<crate::id::ConflictId>("conflict id", &conflict_id)? != current {
+                            return Err(VcsError::new(
+                                VcsErrorCode::Stale,
+                                format!("object {id} is in conflict {current} now"),
+                            ));
+                        }
+                        terms::resolve(
+                            self.repo,
+                            &self.host.schemas,
+                            id,
+                            &state,
+                            &conflict,
+                            &choices,
+                        )?
+                    }
                     VcsResolution::Side { index } => *conflict
                         .sides
                         .get(index as usize)

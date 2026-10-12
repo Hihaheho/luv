@@ -287,6 +287,41 @@ pub enum VcsResolution {
         #[cfg_attr(feature = "ts", ts(optional = nullable))]
         title: Option<String>,
     },
+    /// Answer each term of the conflict on its own: exactly one choice per
+    /// term of the conflict `conflict_id` (the one the caller was shown;
+    /// another one is `stale`). luv merges the sides again and puts every
+    /// answer where its term is, the metadata terms included.
+    Terms {
+        conflict_id: String,
+        choices: Vec<VcsTermChoice>,
+    },
+}
+
+/// The answer to one conflict term.
+#[luv_ffi]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VcsTermChoice {
+    /// The term's position in the conflict view's `terms`.
+    pub term: u32,
+    pub pick: VcsTermPick,
+}
+
+#[luv_ffi]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum VcsTermPick {
+    /// That side's candidate (0 = ours / left, 1 = theirs); a side without
+    /// one (deleted there) removes the field, the key or the object.
+    Side { index: u32 },
+    /// A text region only: the left version followed by the right.
+    Both,
+    /// A value of the caller's: record JSON for a record field or a whole
+    /// record, a JSON string for a text region, a whole text or a metadata
+    /// key such as the title.
+    Value { value_json: String },
+    /// Removes the field, the metadata key, or (for a whole-object term)
+    /// the object; an empty region for a text region.
+    Absent,
 }
 
 #[luv_ffi]

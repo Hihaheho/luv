@@ -240,24 +240,35 @@ pub fn resolve(
             got: choices.len(),
         });
     }
+    let mut choices = choices.iter();
+    Ok(assemble(merged, regions, |region| {
+        match choices.next().expect("counts checked") {
+            RegionChoice::Left => region.left.clone(),
+            RegionChoice::Right => region.right.clone(),
+            RegionChoice::Both => [region.left.as_slice(), &region.right].concat(),
+            RegionChoice::Base => region.base.clone(),
+        }
+    }))
+}
+
+/// The merged bytes with `fill(region)` put where each region goes, in
+/// order: the general form of [`resolve`], for answers that are not one of
+/// the region's own versions.
+pub fn assemble(
+    merged: &[u8],
+    regions: &[ConflictRegion],
+    mut fill: impl FnMut(&ConflictRegion) -> Vec<u8>,
+) -> Vec<u8> {
     let mut out = Vec::with_capacity(merged.len());
     let mut cur = 0;
-    for (region, choice) in regions.iter().zip(choices) {
+    for region in regions {
         let off = region.merged_offset.clamp(cur, merged.len());
         out.extend_from_slice(&merged[cur..off]);
         cur = off;
-        match choice {
-            RegionChoice::Left => out.extend_from_slice(&region.left),
-            RegionChoice::Right => out.extend_from_slice(&region.right),
-            RegionChoice::Both => {
-                out.extend_from_slice(&region.left);
-                out.extend_from_slice(&region.right);
-            }
-            RegionChoice::Base => out.extend_from_slice(&region.base),
-        }
+        out.extend_from_slice(&fill(region));
     }
     out.extend_from_slice(&merged[cur..]);
-    Ok(out)
+    out
 }
 
 fn push_lines(out: &mut Vec<u8>, lines: &[&[u8]]) {

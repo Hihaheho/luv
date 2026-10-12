@@ -416,6 +416,12 @@ fn term(
     }
 }
 
+/// Sets (or removes, with `None`) the value at `path` inside `root`; see
+/// [`set_at`]. For resolvers that answer a term with a value of their own.
+pub fn set_path(root: &mut RecordValue, path: &FieldPath, value: Option<RecordValue>) {
+    set_at(root, &path.0, value);
+}
+
 /// Sets (or removes, with `None`) the value at `path` inside `root`,
 /// following object keys and element IDs. A path whose parent does not
 /// exist is left alone: the terms of `merge_record` always point into the
