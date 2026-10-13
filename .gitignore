@@ -8,6 +8,8 @@
 
 !/Cargo.toml
 !/Cargo.lock
+!/rust-toolchain.toml
+!/.cargo/config.toml
 !/crates/*/Cargo.toml
 !/crates/*/src/**/*.rs
 !/crates/*/tests/**/*.rs

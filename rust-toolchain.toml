@@ -1,0 +1,8 @@
+# A nightly Cargo, so the publish-age cooldown in .cargo/config.toml is
+# enforced; stable Cargo before it ships ignores those keys. Pinned by date
+# so every machine and CI build the same way; keep the workflows'
+# dtolnay/rust-toolchain `toolchain:` equal to this.
+[toolchain]
+channel = "nightly-2026-09-30"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]
