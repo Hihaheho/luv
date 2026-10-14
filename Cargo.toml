@@ -16,7 +16,7 @@ hex = "0.4"
 base64 = "0.22"
 sha2 = "0.10"
 hmac = "0.12"
-rusqlite = { version = "0.39", features = ["modern_sqlite"] }
+rusqlite = { version = "0.40", features = ["modern_sqlite"] }
 tempfile = "3"
 ts-rs = { version = "10", features = ["serde-compat", "no-serde-warnings"] }
 uniffi = "0.31.1"
