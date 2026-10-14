@@ -1,4 +1,4 @@
-//! Golden vectors for the version-1 contract. Every host must reproduce these bytes and IDs from the same inputs;
+//! Golden vectors for the contract. Every host must reproduce these bytes and IDs from the same inputs;
 //! a change here is a format change and needs a new capability.
 //!
 //! Regenerate with `LUVCS_WRITE_VECTORS=1 cargo test -p luvcs --test vectors`
@@ -43,31 +43,60 @@ fn compute() -> serde_json::Value {
     );
 
     // record
-    let record = RecordValue::object([
+    let record = RecordValue::map([
         ("title", RecordValue::text("A note")),
-        ("body", RecordValue::text("line 1\nline 2\n")),
-        ("score", RecordValue::Decimal("-1.25".into())),
-        ("n", RecordValue::Int(-3)),
-        ("flag", RecordValue::Bool(true)),
-        ("nothing", RecordValue::Null),
         (
-            "tags",
-            RecordValue::collection([
-                (
-                    "t1",
-                    RecordValue::object([("label", RecordValue::text("x"))]),
-                ),
-                (
-                    "t2",
-                    RecordValue::object([("label", RecordValue::text("y"))]),
-                ),
+            "body",
+            RecordValue::code("line 1\nline 2\n", Some("markdown")),
+        ),
+        ("score", RecordValue::decimal("-1.250".parse().unwrap())),
+        ("ratio", RecordValue::f64(0.5)),
+        ("n", RecordValue::int(-3)),
+        (
+            "big",
+            RecordValue::int(
+                "-123456789012345678901234567890"
+                    .parse::<num_bigint::BigInt>()
+                    .unwrap(),
+            ),
+        ),
+        ("flag", RecordValue::bool(true)),
+        ("nothing", RecordValue::null()),
+        ("blob", RecordValue::bytes(vec![0, 1, 2, 0xff])),
+        (
+            "pair",
+            RecordValue::tuple([RecordValue::int(1), RecordValue::text("b")]),
+        ),
+        ("tags", RecordValue::set(["x", "y"])),
+        (
+            "by_number",
+            RecordValue::map([(luvcs::record::ObjectKey::from(1), RecordValue::text("one"))]),
+        ),
+        (
+            "links",
+            RecordValue::array([
+                RecordValue::map([("id", RecordValue::text("t1"))]),
+                RecordValue::map([("id", RecordValue::text("t2"))]),
             ]),
+        ),
+        (
+            "status",
+            RecordValue::map([("reason", RecordValue::text("r"))])
+                .with_ext("variant", RecordValue::text("closed")),
         ),
     ]);
     let record_bytes = record.encode().unwrap();
-    out.insert("record.v1.hex".into(), hex::encode(&record_bytes).into());
+    out.insert("record.v2.hex".into(), hex::encode(&record_bytes).into());
     let rcid = content_id(&d, &key, &record_bytes).unwrap();
     out.insert("content_id.record".into(), rcid.to_string().into());
+    // A schema is a record too; its content ID is the schema ID.
+    let schema =
+        RecordValue::from_eure("title = `text`\nbody = `text.markdown`\nbody.$merge = \"text\"\n")
+            .unwrap();
+    let schema_bytes = schema.encode().unwrap();
+    out.insert("schema.hex".into(), hex::encode(&schema_bytes).into());
+    let scid = content_id(&d, &key, &schema_bytes).unwrap();
+    out.insert("content_id.schema".into(), scid.to_string().into());
 
     // states
     let obj_a = ObjectId([0xa0; 16]);
@@ -79,7 +108,7 @@ fn compute() -> serde_json::Value {
         "note",
         ObjectBody::Record {
             content: rcid,
-            schema: "research.note.v1".into(),
+            schema: scid,
         },
     );
     let sa = state_a.id(&d, &key).unwrap();

@@ -20,3 +20,10 @@ rusqlite = { version = "0.39", features = ["modern_sqlite"] }
 tempfile = "3"
 ts-rs = { version = "10", features = ["serde-compat", "no-serde-warnings"] }
 uniffi = "0.31.1"
+eure-reader = { git = "https://github.com/Hihaheho/eure", rev = "5b7afb885604f12e4713265c1b9e19681b2bc00b" }
+eure-document = { git = "https://github.com/Hihaheho/eure", rev = "5b7afb885604f12e4713265c1b9e19681b2bc00b" }
+eure-schema = { git = "https://github.com/Hihaheho/eure", rev = "5b7afb885604f12e4713265c1b9e19681b2bc00b" }
+eure-fmt = { git = "https://github.com/Hihaheho/eure", rev = "5b7afb885604f12e4713265c1b9e19681b2bc00b" }
+eure-macros = { git = "https://github.com/Hihaheho/eure", rev = "5b7afb885604f12e4713265c1b9e19681b2bc00b" }
+eure-parol = { git = "https://github.com/Hihaheho/eure", rev = "5b7afb885604f12e4713265c1b9e19681b2bc00b" }
+num-bigint = "0.4"

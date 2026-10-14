@@ -10,7 +10,6 @@ use luvcs::api::{HostContext, VcsRequest, VcsResponse, execute};
 use luvcs::digest::RustDigest;
 use luvcs::model::ActorKind;
 use luvcs::remote::{DirRemote, MemoryRemote, Remote};
-use luvcs::store::SchemaRegistry;
 use luvcs::sync::{SyncError, pull, push};
 use luvcs_protocol::{EntryBody, WireObject};
 use rusqlite::Connection;
@@ -50,7 +49,6 @@ impl Device {
             now_unix_ms: self.clock.get(),
             device_id: format!("dev-{}", self.seed.get()),
             actor_kind: ActorKind::User,
-            schemas: SchemaRegistry::default(),
         }
     }
 

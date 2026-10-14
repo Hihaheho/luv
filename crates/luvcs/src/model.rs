@@ -41,11 +41,11 @@ impl Capabilities {
             [
                 "core.v1",
                 "text.v1",
-                "record.v1",
+                "record.v2",
                 "binary.v1",
                 "tree.patricia128.v1",
                 "merge.text.v1",
-                "merge.record.v1",
+                "merge.record.v2",
                 "merge.object.v1",
                 "bookmark.v1",
                 "redaction.v1",
@@ -273,10 +273,20 @@ pub struct BlobRef {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObjectBody {
-    Text { content: ContentId },
-    Record { content: ContentId, schema: String },
-    Binary { blob: BlobRef },
-    Conflict { conflict: ConflictId },
+    Text {
+        content: ContentId,
+    },
+    /// `schema` is the content ID of the record schema (itself a record).
+    Record {
+        content: ContentId,
+        schema: ContentId,
+    },
+    Binary {
+        blob: BlobRef,
+    },
+    Conflict {
+        conflict: ConflictId,
+    },
     Deleted,
 }
 
@@ -300,7 +310,7 @@ impl ObjectBody {
             ObjectBody::Record { content, schema } => Value::map([
                 ("kind", Value::text("record")),
                 ("content", content.to_cbor()),
-                ("schema", Value::text(schema.clone())),
+                ("schema", schema.to_cbor()),
             ]),
             ObjectBody::Binary { blob } => Value::map([
                 ("kind", Value::text("binary")),
@@ -333,7 +343,7 @@ impl ObjectBody {
                 let f = Fields::new(KIND, value, &["kind", "content", "schema"])?;
                 Ok(ObjectBody::Record {
                     content: f.id("content", ContentId::from_cbor)?,
-                    schema: f.text("schema", MAX_TYPE_ID_BYTES)?,
+                    schema: f.id("schema", ContentId::from_cbor)?,
                 })
             }
             "binary" => {
@@ -689,6 +699,9 @@ pub enum TermKind {
     /// Both sides set a metadata key (the term's path) to different values.
     /// Candidates are the canonical CBOR of each side's value.
     Metadata,
+    /// The sides merged cleanly, but the result breaks the record schema
+    /// at this path.
+    Invalid,
 }
 
 impl TermKind {
@@ -699,6 +712,7 @@ impl TermKind {
             TermKind::DeletedVsEdited => "deleted_vs_edited",
             TermKind::TextRegion => "text_region",
             TermKind::Metadata => "metadata",
+            TermKind::Invalid => "invalid",
         }
     }
 
@@ -709,6 +723,7 @@ impl TermKind {
             "deleted_vs_edited" => TermKind::DeletedVsEdited,
             "text_region" => TermKind::TextRegion,
             "metadata" => TermKind::Metadata,
+            "invalid" => TermKind::Invalid,
             _ => return None,
         })
     }

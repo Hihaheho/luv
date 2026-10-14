@@ -6,7 +6,8 @@
 //! randomness, clock, device id) and the connection.
 //!
 //! IDs cross the boundary in their prefixed display form (`repo_…`,
-//! `cmt_…`, `obj_…`). Records cross as JSON (see [`record_from_json`]).
+//! `cmt_…`, `obj_…`). Records and record schemas cross as Eure documents
+//! (see [`record_from_eure`]).
 
 use std::collections::BTreeMap;
 
@@ -22,11 +23,12 @@ use crate::id::{
     BlobId, BookmarkId, BookmarkUpdateId, CommitId, IdKey, ObjectId, ObjectStateId, OperationId,
     RealmId, RepoId, WorkspaceId,
 };
+use crate::merge::RECORD_DRIVER_V2;
 use crate::model::{Actor, ActorKind, BlobRef, ObjectBody, ObjectState, TermKind};
-use crate::record::{Element, RecordValue};
+use crate::record::RecordValue;
 use crate::store::{
-    Advance, BookmarkEdit, BookmarkEntry, OperationContext, RecordSource, Repo, SchemaRegistry,
-    Store, StoreError, Workspace,
+    Advance, BookmarkEdit, BookmarkEntry, OperationContext, RecordSource, Repo, Store, StoreError,
+    Workspace,
 };
 
 mod terms;
@@ -39,8 +41,6 @@ pub struct HostContext<'a> {
     pub now_unix_ms: i64,
     pub device_id: String,
     pub actor_kind: ActorKind,
-    /// Record schemas the record merge driver may use.
-    pub schemas: SchemaRegistry,
 }
 
 impl HostContext<'_> {
@@ -106,7 +106,7 @@ impl From<StoreError> for VcsError {
             | StoreError::NoCandidate
             | StoreError::NothingToUndo
             | StoreError::NothingToRedo
-            | StoreError::UnknownSchema(_)
+            | StoreError::Schema(_)
             | StoreError::DuplicateOperation(_)
             | StoreError::BookmarkIsDefault(_) => VcsErrorCode::Invalid,
         };
@@ -231,109 +231,9 @@ pub(crate) fn local_repo(conn: &Connection, repo_id: &str) -> ApiResult<LocalRep
         })
 }
 
-fn record_from_json_value(v: &serde_json::Value) -> ApiResult<RecordValue> {
-    Ok(match v {
-        serde_json::Value::Null => RecordValue::Null,
-        serde_json::Value::Bool(b) => RecordValue::Bool(*b),
-        serde_json::Value::Number(n) => match n.as_i64() {
-            Some(i) => RecordValue::Int(i),
-            None => RecordValue::Decimal(n.to_string()),
-        },
-        serde_json::Value::String(s) => RecordValue::Text(s.clone()),
-        serde_json::Value::Array(_) => {
-            return Err(VcsError::invalid(
-                "record arrays must be written as {\"$elements\": [{\"id\": ..., \"value\": ...}]}",
-            ));
-        }
-        serde_json::Value::Object(m) => {
-            if let Some(elements) = m.get("$elements") {
-                if m.len() != 1 {
-                    return Err(VcsError::invalid("$elements must be the only key"));
-                }
-                let list = elements
-                    .as_array()
-                    .ok_or_else(|| VcsError::invalid("$elements must be an array"))?;
-                let mut out = Vec::with_capacity(list.len());
-                for e in list {
-                    let id = e
-                        .get("id")
-                        .and_then(serde_json::Value::as_str)
-                        .ok_or_else(|| VcsError::invalid("element needs a string id"))?;
-                    let value = e.get("value").unwrap_or(&serde_json::Value::Null);
-                    out.push(Element {
-                        id: id.to_owned(),
-                        value: record_from_json_value(value)?,
-                    });
-                }
-                RecordValue::Collection(out)
-            } else if let Some(d) = m.get("$dec") {
-                let d = d
-                    .as_str()
-                    .ok_or_else(|| VcsError::invalid("$dec must be a string"))?;
-                RecordValue::Decimal(d.to_owned())
-            } else if let Some(b) = m.get("$bytes") {
-                let b = b
-                    .as_str()
-                    .ok_or_else(|| VcsError::invalid("$bytes must be a hex string"))?;
-                RecordValue::Bytes(hex::decode(b).map_err(|e| VcsError::invalid(e.to_string()))?)
-            } else {
-                let mut out = BTreeMap::new();
-                for (k, v) in m {
-                    out.insert(k.clone(), record_from_json_value(v)?);
-                }
-                RecordValue::Object(out)
-            }
-        }
-    })
-}
-
-/// Parses the JSON form of a record: objects are objects, collections are
-/// `{"$elements": [{"id": "...", "value": ...}]}`, decimals
-/// `{"$dec": "1.50"}`, bytes `{"$bytes": "<hex>"}`.
-pub fn record_from_json(json: &str) -> ApiResult<RecordValue> {
-    let v: serde_json::Value =
-        serde_json::from_str(json).map_err(|e| VcsError::invalid(e.to_string()))?;
-    let record = record_from_json_value(&v)?;
-    record
-        .validate()
-        .map_err(|e| VcsError::invalid(e.to_string()))?;
-    Ok(record)
-}
-
-pub fn record_to_json(record: &RecordValue) -> serde_json::Value {
-    use serde_json::{Map, Value as J};
-    match record {
-        RecordValue::Null => J::Null,
-        RecordValue::Bool(b) => J::Bool(*b),
-        RecordValue::Int(i) => J::from(*i),
-        RecordValue::Decimal(d) => {
-            J::Object(Map::from_iter([("$dec".to_owned(), J::from(d.clone()))]))
-        }
-        RecordValue::Text(s) => J::from(s.clone()),
-        RecordValue::Bytes(b) => J::Object(Map::from_iter([(
-            "$bytes".to_owned(),
-            J::from(hex::encode(b)),
-        )])),
-        RecordValue::Object(m) => J::Object(
-            m.iter()
-                .map(|(k, v)| (k.clone(), record_to_json(v)))
-                .collect(),
-        ),
-        RecordValue::Collection(elements) => J::Object(Map::from_iter([(
-            "$elements".to_owned(),
-            J::Array(
-                elements
-                    .iter()
-                    .map(|e| {
-                        J::Object(Map::from_iter([
-                            ("id".to_owned(), J::from(e.id.clone())),
-                            ("value".to_owned(), record_to_json(&e.value)),
-                        ]))
-                    })
-                    .collect(),
-            ),
-        )])),
-    }
+/// Parses a record given as an Eure document.
+pub fn record_from_eure(source: &str) -> ApiResult<RecordValue> {
+    RecordValue::from_eure(source).map_err(|e| VcsError::invalid(e.to_string()))
 }
 
 fn cbor_to_json(v: &Value) -> serde_json::Value {
@@ -609,15 +509,14 @@ impl<D: Digest> Session<'_, '_, '_, D> {
         Ok((realm.id, id, blob_info_view(&info)))
     }
 
-    fn content_record_json(&self, id: crate::id::ContentId) -> ApiResult<Option<String>> {
+    /// A record, or a value inside one (a term candidate), as Eure.
+    fn content_record_eure(&self, id: crate::id::ContentId) -> ApiResult<Option<String>> {
         self.repo
             .get_content(id)?
             .map(|bytes| {
-                let value = crate::cbor::decode(&bytes)
+                let record = RecordValue::decode(&bytes)
                     .map_err(|e| VcsError::new(VcsErrorCode::Internal, e.to_string()))?;
-                let record = RecordValue::from_cbor(&value)
-                    .map_err(|e| VcsError::new(VcsErrorCode::Internal, e.to_string()))?;
-                Ok(record_to_json(&record).to_string())
+                Ok(record.to_eure())
             })
             .transpose()
     }
@@ -636,7 +535,7 @@ impl<D: Digest> Session<'_, '_, '_, D> {
         let state = self.repo.get_state(id)?;
         Ok(match state.body {
             ObjectBody::Text { content } => self.content_text(content)?,
-            ObjectBody::Record { content, .. } => self.content_record_json(content)?,
+            ObjectBody::Record { content, .. } => self.content_record_eure(content)?,
             _ => None,
         })
     }
@@ -658,14 +557,14 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                 candidates.push(match cand {
                     Some(id) if t.kind == TermKind::Metadata => self.content_metadata_text(*id)?,
                     Some(id) => {
-                        let is_record = c.driver == "merge.record.v1"
+                        let is_record = c.driver == RECORD_DRIVER_V2
                             || c.sides
                                 .get(index)
                                 .map(|s| self.repo.get_state(*s))
                                 .transpose()?
                                 .is_some_and(|s| matches!(s.body, ObjectBody::Record { .. }));
                         if is_record {
-                            self.content_record_json(*id)?
+                            self.content_record_eure(*id)?
                         } else {
                             self.content_text(*id)?
                         }
@@ -683,12 +582,12 @@ impl<D: Digest> Session<'_, '_, '_, D> {
             object_id: object_id.to_string(),
             conflict_id: conflict_id.to_string(),
             driver: c.driver.clone(),
-            merged_record_json: match c.merged {
-                Some(m) if c.driver == "merge.record.v1" => self.content_record_json(m)?,
+            merged_record_eure: match c.merged {
+                Some(m) if c.driver == RECORD_DRIVER_V2 => self.content_record_eure(m)?,
                 _ => None,
             },
             merged_text: match c.merged {
-                Some(m) if c.driver != "merge.record.v1" => self.content_text(m)?,
+                Some(m) if c.driver != RECORD_DRIVER_V2 => self.content_text(m)?,
                 _ => None,
             },
             marked_text: self.marked_text(&c)?,
@@ -739,7 +638,7 @@ impl<D: Digest> Session<'_, '_, '_, D> {
             title: title_of(&state),
             body_kind: String::new(),
             text: None,
-            record_json: None,
+            record_eure: None,
             schema_id: None,
             conflict: None,
             blob: None,
@@ -754,12 +653,8 @@ impl<D: Digest> Session<'_, '_, '_, D> {
             }
             ObjectBody::Record { content, schema } => {
                 view.body_kind = "record".into();
-                view.schema_id = Some(schema.clone());
-                if let Some(bytes) = self.repo.get_content(*content)? {
-                    let record = RecordValue::decode(&bytes)
-                        .map_err(|e| VcsError::new(VcsErrorCode::Internal, e.to_string()))?;
-                    view.record_json = Some(record_to_json(&record).to_string());
-                }
+                view.schema_id = Some(schema.to_string());
+                view.record_eure = self.content_record_eure(*content)?;
                 view.redacted = self.repo.is_redacted_content(*content)?;
             }
             ObjectBody::Binary { blob } => {
@@ -944,11 +839,12 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                 object_id,
                 type_id,
                 schema_id,
-                record_json,
+                record_eure,
                 title,
                 ..
             } => {
-                let record = record_from_json(&record_json)?;
+                let record = record_from_eure(&record_eure)?;
+                let schema = parse("schema id", &schema_id)?;
                 let oid = match &object_id {
                     Some(s) => parse("object id", s)?,
                     None => ObjectId(self.host.random_16()?),
@@ -956,7 +852,7 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                 let state = self.repo.put_record_state(
                     oid,
                     &type_id,
-                    &schema_id,
+                    schema,
                     &record,
                     metadata(title.as_deref()),
                 )?;
@@ -1001,6 +897,27 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                 let id = self.save(Some(&oid.to_string()), state_id)?;
                 VcsResponse::Object {
                     object: self.object_view(id, state_id)?,
+                }
+            }
+            VcsRequest::PutSchema { schema_eure, .. } => {
+                let value = record_from_eure(&schema_eure)?;
+                let id = self.repo.put_schema(&value)?;
+                VcsResponse::Schema {
+                    schema_id: id.to_string(),
+                    schema_eure: value.to_eure(),
+                }
+            }
+            VcsRequest::ReadSchema { schema_id, .. } => {
+                let id = parse("schema id", &schema_id)?;
+                let eure = self.content_record_eure(id)?.ok_or_else(|| {
+                    VcsError::new(
+                        VcsErrorCode::NotFound,
+                        format!("schema {schema_id} is not here"),
+                    )
+                })?;
+                VcsResponse::Schema {
+                    schema_id,
+                    schema_eure: eure,
                 }
             }
             VcsRequest::PutBlob { data_base64, .. } => {
@@ -1240,14 +1157,7 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                                 format!("object {id} is in conflict {current} now"),
                             ));
                         }
-                        terms::resolve(
-                            self.repo,
-                            &self.host.schemas,
-                            id,
-                            &state,
-                            &conflict,
-                            &choices,
-                        )?
+                        terms::resolve(self.repo, id, &state, &conflict, &choices)?
                     }
                     VcsResolution::Side { index } => *conflict
                         .sides
@@ -1259,8 +1169,8 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                         text.as_bytes(),
                         resolved_metadata(title)?,
                     )?,
-                    VcsResolution::Record { record_json, title } => {
-                        let record = record_from_json(&record_json)?;
+                    VcsResolution::Record { record_eure, title } => {
+                        let record = record_from_eure(&record_eure)?;
                         let schema = conflict
                             .sides
                             .iter()
@@ -1272,7 +1182,7 @@ impl<D: Digest> Session<'_, '_, '_, D> {
                         self.repo.put_record_state(
                             id,
                             &state.type_id,
-                            &schema,
+                            schema,
                             &record,
                             resolved_metadata(title)?,
                         )?
@@ -1503,6 +1413,8 @@ fn repo_id_of(request: &VcsRequest) -> Option<&str> {
         | VcsRequest::SaveRecord { repo_id, .. }
         | VcsRequest::SaveBinary { repo_id, .. }
         | VcsRequest::PutBlob { repo_id, .. }
+        | VcsRequest::PutSchema { repo_id, .. }
+        | VcsRequest::ReadSchema { repo_id, .. }
         | VcsRequest::ReadBlob { repo_id, .. }
         | VcsRequest::ListBlobs { repo_id }
         | VcsRequest::DeleteObject { repo_id, .. }
@@ -1584,7 +1496,7 @@ fn execute_inner(
     request: VcsRequest,
 ) -> ApiResult<VcsResponse> {
     ensure_local_schema(conn)?;
-    let mut store = Store::open(conn, host.digest)?.with_schemas(host.schemas.clone());
+    let mut store = Store::open(conn, host.digest)?;
     match &request {
         VcsRequest::CreateRepo { name } => {
             let tx = conn.unchecked_transaction()?;
@@ -1696,7 +1608,6 @@ mod tests {
             now_unix_ms: 0,
             device_id: "test".into(),
             actor_kind: ActorKind::User,
-            schemas: SchemaRegistry::default(),
         };
         ensure_local_schema(&conn).unwrap();
         let local = create_local_repo(&conn, &host, "test").unwrap();
@@ -1731,6 +1642,6 @@ mod tests {
         };
         let view = session.conflict_view(object_id, id).unwrap();
         assert_eq!(view.merged_text.as_deref(), Some("provisional text"));
-        assert_eq!(view.merged_record_json, None);
+        assert_eq!(view.merged_record_eure, None);
     }
 }

@@ -10,8 +10,8 @@ use luvcs::digest::RustDigest;
 use luvcs::id::{IdKey, ObjectId, OperationId, RepoId, WorkspaceId};
 use luvcs::merge::text::{RegionChoice, resolve as resolve_text};
 use luvcs::model::{Actor, ActorKind, ObjectBody, TermKind};
-use luvcs::record::{FieldPolicy, RecordSchema, RecordValue};
-use luvcs::store::{OperationContext, RecordSource, SchemaRegistry, Store, StoreError};
+use luvcs::record::{Data, FieldPath, RecordValue};
+use luvcs::store::{OperationContext, RecordSource, Store, StoreError};
 use rusqlite::Connection;
 
 const REPO: RepoId = RepoId([1; 16]);
@@ -25,13 +25,7 @@ fn key() -> IdKey {
 }
 
 fn store(conn: &Connection) -> Store<'_, RustDigest> {
-    let mut s = Store::open(conn, RustDigest).unwrap().with_schemas(
-        SchemaRegistry::default().register(
-            RecordSchema::new("note.v1")
-                .field("body", FieldPolicy::Text)
-                .field("tags", FieldPolicy::Set),
-        ),
-    );
+    let mut s = Store::open(conn, RustDigest).unwrap();
     s.create_repo(REPO, 1).unwrap();
     s
 }
@@ -303,16 +297,32 @@ fn integrate_merges_text_and_records_and_stores_structured_conflicts() {
     let t0 = repo
         .put_text_state(NOTE, "note", b"a\nb\nc\n", Value::Map(vec![]))
         .unwrap();
-    let rec0 = RecordValue::object([
+    let schema = repo
+        .put_schema(
+            &RecordValue::from_eure(
+                "title = `text`\nbody = `text`\nbody.$merge = \"text\"\ntags {\n  $variant: set\n  item = `text`\n}\n",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    let rec0 = RecordValue::map([
         ("title", RecordValue::text("T")),
         ("body", RecordValue::text("x\ny\n")),
-        (
-            "tags",
-            RecordValue::collection([("t1", RecordValue::text("one"))]),
-        ),
+        ("tags", RecordValue::set(["one"])),
     ]);
+    // A record its schema refuses is not stored.
+    assert!(matches!(
+        repo.put_record_state(
+            OTHER,
+            "note",
+            schema,
+            &RecordValue::map([("title", RecordValue::int(1))]),
+            Value::Map(vec![])
+        ),
+        Err(StoreError::Invalid(_))
+    ));
     let r0 = repo
-        .put_record_state(OTHER, "note", "note.v1", &rec0, Value::Map(vec![]))
+        .put_record_state(OTHER, "note", schema, &rec0, Value::Map(vec![]))
         .unwrap();
     repo.save_working(&ctx.next(WS, None), &[(NOTE, Some(t0)), (OTHER, Some(r0))])
         .unwrap();
@@ -324,19 +334,13 @@ fn integrate_merges_text_and_records_and_stores_structured_conflicts() {
     let t_l = repo
         .put_text_state(NOTE, "note", b"A\nb\nc\n", Value::Map(vec![]))
         .unwrap();
-    let rec_l = RecordValue::object([
+    let rec_l = RecordValue::map([
         ("title", RecordValue::text("T")),
         ("body", RecordValue::text("x\ny\n")),
-        (
-            "tags",
-            RecordValue::collection([
-                ("t1", RecordValue::text("one")),
-                ("t2", RecordValue::text("two")),
-            ]),
-        ),
+        ("tags", RecordValue::set(["one", "two"])),
     ]);
     let r_l = repo
-        .put_record_state(OTHER, "note", "note.v1", &rec_l, Value::Map(vec![]))
+        .put_record_state(OTHER, "note", schema, &rec_l, Value::Map(vec![]))
         .unwrap();
     repo.save_working(
         &ctx.next(WS, None),
@@ -352,16 +356,13 @@ fn integrate_merges_text_and_records_and_stores_structured_conflicts() {
     let t_r = repo
         .put_text_state(NOTE, "note", b"a\nb\nC\n", Value::Map(vec![]))
         .unwrap();
-    let rec_r = RecordValue::object([
+    let rec_r = RecordValue::map([
         ("title", RecordValue::text("T2")),
         ("body", RecordValue::text("x\ny\n")),
-        (
-            "tags",
-            RecordValue::collection([("t1", RecordValue::text("one"))]),
-        ),
+        ("tags", RecordValue::set(["one"])),
     ]);
     let r_r = repo
-        .put_record_state(OTHER, "note", "note.v1", &rec_r, Value::Map(vec![]))
+        .put_record_state(OTHER, "note", schema, &rec_r, Value::Map(vec![]))
         .unwrap();
     repo.save_working(
         &ctx.next(ws2, None),
@@ -390,18 +391,13 @@ fn integrate_merges_text_and_records_and_stores_structured_conflicts() {
         b => panic!("{b:?}"),
     };
     assert_eq!(
-        record.at(&luvcs::record::FieldPath::parse("title")),
+        record.at(&FieldPath::root().key("title")),
         Some(&RecordValue::text("T2"))
     );
-    assert_eq!(
-        record
-            .at(&luvcs::record::FieldPath::parse("tags"))
-            .unwrap()
-            .as_collection()
-            .unwrap()
-            .len(),
-        2
-    );
+    assert!(matches!(
+        &record.at(&FieldPath::root().key("tags")).unwrap().data,
+        Data::Set(tags) if tags.len() == 2
+    ));
 
     // Now a real conflict: both sides edit the same line.
     let t_l2 = repo

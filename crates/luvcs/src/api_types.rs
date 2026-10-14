@@ -33,7 +33,8 @@ pub enum VcsRequest {
         #[cfg_attr(feature = "ts", ts(optional = nullable))]
         title: Option<String>,
     },
-    /// Saves a record object (JSON form, see [`record_from_json`]).
+    /// Saves a record object, given as an Eure document, under the schema
+    /// `schema_id` (from `PutSchema`). The record must match the schema.
     SaveRecord {
         repo_id: String,
         #[serde(default)]
@@ -41,7 +42,7 @@ pub enum VcsRequest {
         object_id: Option<String>,
         type_id: String,
         schema_id: String,
-        record_json: String,
+        record_eure: String,
         #[serde(default)]
         #[cfg_attr(feature = "ts", ts(optional = nullable))]
         title: Option<String>,
@@ -67,6 +68,19 @@ pub enum VcsRequest {
     PutBlob {
         repo_id: String,
         data_base64: String,
+    },
+    /// Stores a record schema, given as an Eure Schema document. Its ID is
+    /// the ID of its content (`cnt_…`): the same schema is the same ID, and
+    /// it travels with every record that names it. `$merge` and
+    /// `$merge-key` on its nodes say how records merge.
+    PutSchema {
+        repo_id: String,
+        schema_eure: String,
+    },
+    /// Reads a record schema back as Eure.
+    ReadSchema {
+        repo_id: String,
+        schema_id: String,
     },
     /// Reads `[offset, offset + length)` of a local blob (the whole blob
     /// when both are omitted). A whole read is verified against the
@@ -281,8 +295,9 @@ pub enum VcsResolution {
         #[cfg_attr(feature = "ts", ts(optional = nullable))]
         title: Option<String>,
     },
+    /// Give the record, as an Eure document.
     Record {
-        record_json: String,
+        record_eure: String,
         #[serde(default)]
         #[cfg_attr(feature = "ts", ts(optional = nullable))]
         title: Option<String>,
@@ -315,10 +330,10 @@ pub enum VcsTermPick {
     Side { index: u32 },
     /// A text region only: the left version followed by the right.
     Both,
-    /// A value of the caller's: record JSON for a record field or a whole
-    /// record, a JSON string for a text region, a whole text or a metadata
-    /// key such as the title.
-    Value { value_json: String },
+    /// A value of the caller's: an Eure document for a record field or a
+    /// whole record (`= 1` for a value that is not a map), the text itself
+    /// for a text region, a whole text or a metadata key such as the title.
+    Value { value: String },
     /// Removes the field, the metadata key, or (for a whole-object term)
     /// the object; an empty region for a text region.
     Absent,
@@ -402,6 +417,10 @@ pub enum VcsResponse {
     },
     Blob {
         blob: VcsBlobInfo,
+    },
+    Schema {
+        schema_id: String,
+        schema_eure: String,
     },
     Blobs {
         blobs: Vec<VcsBlobInfo>,
@@ -548,8 +567,9 @@ pub struct VcsObjectView {
     pub body_kind: String,
     #[cfg_attr(feature = "ts", ts(optional = nullable))]
     pub text: Option<String>,
+    /// The record as an Eure document.
     #[cfg_attr(feature = "ts", ts(optional = nullable))]
-    pub record_json: Option<String>,
+    pub record_eure: Option<String>,
     #[cfg_attr(feature = "ts", ts(optional = nullable))]
     pub schema_id: Option<String>,
     #[cfg_attr(feature = "ts", ts(optional = nullable))]
@@ -557,7 +577,7 @@ pub struct VcsObjectView {
     #[cfg_attr(feature = "ts", ts(optional = nullable))]
     pub blob: Option<VcsBlobRefView>,
     pub metadata_json: String,
-    /// The body was erased by a `Purge`: `text`, `record_json` or the blob's
+    /// The body was erased by a `Purge`: `text`, `record_eure` or the blob's
     /// bytes are gone, the rest of the view is as it was.
     #[serde(default)]
     pub redacted: bool,
@@ -567,10 +587,13 @@ pub struct VcsObjectView {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct VcsConflictTermView {
     pub path: String,
-    /// `value`, `order`, `deleted_vs_edited`, `text_region`, `metadata`
-    /// (`path` is then the metadata key, e.g. `title`).
+    /// `value`, `order`, `deleted_vs_edited`, `text_region`, `invalid` (a
+    /// clean merge that breaks the record schema there), `metadata` (`path`
+    /// is then the metadata key, e.g. `title`). A record path is in Eure's
+    /// path syntax.
     pub kind: String,
-    /// One candidate per side: text for text states, JSON for record states,
+    /// One candidate per side: text for text states, an Eure document for
+    /// record states,
     /// the value for a text metadata key.
     /// `None` when that side has no content (including deletion).
     pub candidates: Vec<Option<String>>,
@@ -591,11 +614,11 @@ pub struct VcsConflictView {
     #[serde(default)]
     #[cfg_attr(feature = "ts", ts(optional = nullable))]
     pub marked_text: Option<String>,
-    /// Provisional record including non-conflicting fields, in record JSON form.
+    /// Provisional record including non-conflicting fields, as Eure.
     #[serde(default)]
     #[cfg_attr(feature = "ts", ts(optional = nullable))]
-    pub merged_record_json: Option<String>,
-    /// Full text or record JSON of each side, for whole-side resolution.
+    pub merged_record_eure: Option<String>,
+    /// Full text or record Eure of each side, for whole-side resolution.
     pub sides: Vec<Option<String>>,
     pub terms: Vec<VcsConflictTermView>,
 }

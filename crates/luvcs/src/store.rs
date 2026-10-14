@@ -7,7 +7,9 @@
 //! logical ID is never overwritten: storing different bytes under an existing
 //! ID is an [`StoreError::IdentityConflict`].
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+use std::rc::Rc;
 
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 
@@ -18,13 +20,14 @@ use crate::id::{
     BlobId, BookmarkId, BookmarkUpdateId, ChangeId, CommitId, ConflictId, ContentId, IdKey,
     ObjectId, ObjectStateId, OperationId, RepoId, TreeId, WorkspaceId, content_id,
 };
-use crate::merge::{self, RECORD_DRIVER_V1, TEXT_DRIVER_V1};
+use crate::merge::{self, RECORD_DRIVER_V2, TEXT_DRIVER_V1};
 use crate::model::{
     Actor, COMMIT_FORMAT_V1, CONFLICT_FORMAT_V1, Capabilities, Commit, Conflict, ConflictTerm,
     CoreError, ObjectBody, ObjectState, TermKind,
 };
-use crate::record::{RecordSchema, RecordValue};
+use crate::record::RecordValue;
 use crate::redaction::Redaction;
+use crate::schema::RecordSchema;
 use crate::tree::{self, Node, TreeError};
 
 mod bookmarks;
@@ -74,8 +77,8 @@ pub enum StoreError {
     NothingToUndo,
     #[error("nothing to redo")]
     NothingToRedo,
-    #[error("record schema {0} is not registered")]
-    UnknownSchema(String),
+    #[error("{0}")]
+    Schema(#[from] crate::schema::SchemaError),
     #[error("operation {0} was already applied")]
     DuplicateOperation(OperationId),
     #[error("binding {0} is not adopted by this database")]
@@ -210,23 +213,6 @@ pub struct OperationEntry {
     pub undone: bool,
 }
 
-/// Record schemas by schema id, for the record merge driver.
-#[derive(Debug, Clone, Default)]
-pub struct SchemaRegistry {
-    schemas: HashMap<String, RecordSchema>,
-}
-
-impl SchemaRegistry {
-    pub fn register(mut self, schema: RecordSchema) -> Self {
-        self.schemas.insert(schema.id.clone(), schema);
-        self
-    }
-
-    pub fn get(&self, id: &str) -> Option<&RecordSchema> {
-        self.schemas.get(id)
-    }
-}
-
 const SCHEMA_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS vcs_meta (
   key TEXT PRIMARY KEY NOT NULL,
@@ -322,7 +308,29 @@ pub struct Store<'c, D: Digest> {
     conn: &'c Connection,
     digest: D,
     caps: Capabilities,
-    schemas: SchemaRegistry,
+    schemas: SchemaCache,
+}
+
+/// Compiled record schemas by repo and schema ID. A schema is content, so
+/// an entry never goes stale.
+type SchemaCache = RefCell<HashMap<(RepoId, ContentId), Rc<RecordSchema>>>;
+
+/// The schema stored as `id`, compiled once per store.
+fn cached_schema(
+    cache: &SchemaCache,
+    repo: RepoId,
+    id: ContentId,
+    bytes: impl FnOnce() -> Result<Option<Vec<u8>>>,
+) -> Result<Option<Rc<RecordSchema>>> {
+    if let Some(s) = cache.borrow().get(&(repo, id)) {
+        return Ok(Some(s.clone()));
+    }
+    let Some(bytes) = bytes()? else {
+        return Ok(None);
+    };
+    let schema = Rc::new(RecordSchema::from_value(&RecordValue::decode(&bytes)?)?);
+    cache.borrow_mut().insert((repo, id), schema.clone());
+    Ok(Some(schema))
 }
 
 impl<'c, D: Digest> Store<'c, D> {
@@ -353,13 +361,8 @@ impl<'c, D: Digest> Store<'c, D> {
             conn,
             digest,
             caps: Capabilities::v1(),
-            schemas: SchemaRegistry::default(),
+            schemas: RefCell::default(),
         })
-    }
-
-    pub fn with_schemas(mut self, schemas: SchemaRegistry) -> Self {
-        self.schemas = schemas;
-        self
     }
 
     pub fn connection(&self) -> &Connection {
@@ -812,25 +815,60 @@ impl<D: Digest> Repo<'_, '_, D> {
         self.put_state(&state)
     }
 
-    /// Convenience: store a record and a `Record` state for `object_id`.
+    /// Stores a record schema (kept as a record) and returns its ID, the
+    /// content ID of the record. The schema must compile.
+    pub fn put_schema(&mut self, schema: &RecordValue) -> Result<ContentId> {
+        RecordSchema::from_value(schema)?;
+        self.put_content(&schema.encode()?)
+    }
+
+    /// The record schema stored as `id`.
+    pub fn schema(&self, id: ContentId) -> Result<Rc<RecordSchema>> {
+        cached_schema(&self.store.schemas, self.repo_id, id, || {
+            self.get_content(id)
+        })?
+        .ok_or_else(|| StoreError::MissingObject {
+            kind: "schema",
+            id: id.to_string(),
+        })
+    }
+
+    /// Checks `record` against the schema stored as `schema`.
+    pub fn check_record(&self, schema: ContentId, record: &RecordValue) -> Result<()> {
+        let violations = self.schema(schema)?.violations(record);
+        if violations.is_empty() {
+            return Ok(());
+        }
+        let lines: Vec<String> = violations
+            .iter()
+            .map(|v| {
+                if v.path.0.is_empty() {
+                    v.message.clone()
+                } else {
+                    format!("{}: {}", v.path, v.message)
+                }
+            })
+            .collect();
+        Err(StoreError::Invalid(format!(
+            "the record does not match schema {schema}: {}",
+            lines.join("; ")
+        )))
+    }
+
+    /// Convenience: check a record against its schema and store it and a
+    /// `Record` state for `object_id`.
     pub fn put_record_state(
         &mut self,
         object_id: ObjectId,
         type_id: &str,
-        schema: &str,
+        schema: ContentId,
         record: &RecordValue,
         metadata: Value,
     ) -> Result<ObjectStateId> {
+        self.check_record(schema, record)?;
         let content = self.put_content(&record.encode()?)?;
-        let state = ObjectState::new(
-            object_id,
-            type_id,
-            ObjectBody::Record {
-                content,
-                schema: schema.to_owned(),
-            },
-        )
-        .with_metadata(metadata);
+        let state = ObjectState::new(object_id, type_id, ObjectBody::Record { content, schema })
+            .with_metadata(metadata);
         self.put_state(&state)
     }
 
@@ -1017,8 +1055,8 @@ impl<D: Digest> Repo<'_, '_, D> {
         let repo = self.repo_id;
         let key = self.key.clone();
         let caps = self.store.caps.clone();
-        let schemas = self.store.schemas.clone();
         let digest = &self.store.digest;
+        let schemas = &self.store.schemas;
         let tx = self.store.conn.unchecked_transaction()?;
         let before = {
             let reader = Reader {
@@ -1051,7 +1089,7 @@ impl<D: Digest> Repo<'_, '_, D> {
             key: &key,
             digest,
             caps: &caps,
-            schemas: &schemas,
+            schemas,
             pending: Pending::default(),
             visible_added: Vec::new(),
             visible_removed: Vec::new(),
@@ -1870,7 +1908,7 @@ struct Executor<'t, 'c, D: Digest> {
     key: &'t IdKey,
     digest: &'t D,
     caps: &'t Capabilities,
-    schemas: &'t SchemaRegistry,
+    schemas: &'t SchemaCache,
     pending: Pending,
     visible_added: Vec<CommitId>,
     visible_removed: Vec<CommitId>,
@@ -2312,7 +2350,7 @@ impl<D: Digest> Executor<'_, '_, D> {
                 match body {
                     ObjectBody::Text { content } => (TEXT_DRIVER_V1, (Some(content), terms)),
                     ObjectBody::Record { content, .. } => {
-                        (RECORD_DRIVER_V1, (Some(content), terms))
+                        (RECORD_DRIVER_V2, (Some(content), terms))
                     }
                     _ => ("merge.object.v1", (None, terms)),
                 }
@@ -2390,11 +2428,20 @@ impl<D: Digest> Executor<'_, '_, D> {
                         },
                         base_body,
                     ) if l.type_id == r.type_id && ls_ == rs_ => {
-                        let schema = self
-                            .schemas
-                            .get(ls_)
-                            .cloned()
-                            .ok_or_else(|| StoreError::UnknownSchema(ls_.clone()))?;
+                        // An erased schema leaves nothing to merge by.
+                        let schema = cached_schema(self.schemas, self.repo, *ls_, || {
+                            self.content_unless_redacted(*ls_)
+                        })?;
+                        let Some(schema) = schema else {
+                            let frame = ConflictFrame {
+                                object_id,
+                                base: base_ids,
+                                sides,
+                                type_hint,
+                                meta,
+                            };
+                            return self.whole_object_conflict(frame, &ls, &rs);
+                        };
                         let base_rec = match base_body {
                             Some(ObjectBody::Record { content, .. }) => self
                                 .content_unless_redacted(*content)?
@@ -2422,14 +2469,14 @@ impl<D: Digest> Executor<'_, '_, D> {
                                 let content = self.put_content(&v.encode()?)?;
                                 if !meta.conflicts.is_empty() {
                                     let terms = self.metadata_terms(&meta.conflicts)?;
-                                    (RECORD_DRIVER_V1, (Some(content), terms))
+                                    (RECORD_DRIVER_V2, (Some(content), terms))
                                 } else {
                                     let state = ObjectState::new(
                                         object_id,
                                         &l.type_id,
                                         ObjectBody::Record {
                                             content,
-                                            schema: ls_.clone(),
+                                            schema: *ls_,
                                         },
                                     )
                                     .with_metadata(meta.merged);
@@ -2460,7 +2507,7 @@ impl<D: Digest> Executor<'_, '_, D> {
                                     });
                                 }
                                 terms.extend(self.metadata_terms(&meta.conflicts)?);
-                                (RECORD_DRIVER_V1, (Some(merged_id), terms))
+                                (RECORD_DRIVER_V2, (Some(merged_id), terms))
                             }
                         }
                     }

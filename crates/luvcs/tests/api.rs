@@ -7,13 +7,26 @@ use std::rc::Rc;
 
 use luvcs::api::{
     HostContext, VcsError, VcsErrorCode, VcsRequest, VcsResolution, VcsResponse, execute,
-    record_from_json, record_to_json,
+    record_from_eure,
 };
 use luvcs::digest::RustDigest;
 use luvcs::model::ActorKind;
-use luvcs::record::{FieldPolicy, RecordSchema};
-use luvcs::store::SchemaRegistry;
+use luvcs::record::RecordValue;
 use rusqlite::Connection;
+
+const CARD_SCHEMA: &str = r#"
+title = `text`
+title.$merge = "text"
+count = `integer`
+count.$optional = true
+price = `decimal`
+price.$optional = true
+tags {
+  $variant: set
+  item = `text`
+}
+tags.$optional = true
+"#;
 
 type RandomFn = dyn Fn(&mut [u8]) -> Result<(), String>;
 
@@ -30,11 +43,6 @@ impl Host {
             now_unix_ms: 1_700_000_000_000 + i64::from(self.counter.get()),
             device_id: "dev-a".into(),
             actor_kind: ActorKind::User,
-            schemas: SchemaRegistry::default().register(
-                RecordSchema::new("card.v1")
-                    .field("title", FieldPolicy::Text)
-                    .field("tags", FieldPolicy::Set),
-            ),
         }
     }
 }
@@ -70,6 +78,20 @@ fn create(conn: &Connection, host: &Host) -> String {
         },
     ) {
         VcsResponse::Repo { repo } => repo.repo_id,
+        other => panic!("{other:?}"),
+    }
+}
+
+fn put_schema(conn: &Connection, host: &Host, repo: &str) -> String {
+    match run(
+        conn,
+        host,
+        VcsRequest::PutSchema {
+            repo_id: repo.into(),
+            schema_eure: CARD_SCHEMA.into(),
+        },
+    ) {
+        VcsResponse::Schema { schema_id, .. } => schema_id,
         other => panic!("{other:?}"),
     }
 }
@@ -315,42 +337,77 @@ fn text_lifecycle_record_log_undo() {
 }
 
 #[test]
-fn record_json_round_trip_and_save() {
-    let json = r#"{"title":"t","tags":{"$elements":[{"id":"a","value":null},{"id":"b","value":null}]},"n":3,"price":{"$dec":"1.5"}}"#;
-    let record = record_from_json(json).unwrap();
-    let back = record_to_json(&record);
+fn record_eure_round_trip_and_save() {
+    let eure = "title = \"t\"\ntags = #{\"a\", \"b\"}\ncount = 3\nprice = 1.50\n";
+    let record = record_from_eure(eure).unwrap();
     assert_eq!(
-        back,
-        serde_json::from_str::<serde_json::Value>(json).unwrap()
-    );
-    assert_eq!(
-        record_from_json("[1,2]").unwrap_err().code,
+        record_from_eure("a = !").unwrap_err().code,
         VcsErrorCode::Invalid
     );
 
     let conn = Connection::open_in_memory().unwrap();
     let host = host();
     let repo = create(&conn, &host);
+    let schema_id = put_schema(&conn, &host, &repo);
+    assert!(schema_id.starts_with("cnt_"));
+    // The same schema is the same ID, however it is written.
+    assert_eq!(put_schema(&conn, &host, &repo), schema_id);
     match run(
         &conn,
         &host,
-        VcsRequest::SaveRecord {
-            repo_id: repo,
-            object_id: None,
-            type_id: "card".into(),
-            schema_id: "card.v1".into(),
-            record_json: json.into(),
-            title: None,
+        VcsRequest::ReadSchema {
+            repo_id: repo.clone(),
+            schema_id: schema_id.clone(),
         },
     ) {
+        VcsResponse::Schema { schema_eure, .. } => assert_eq!(
+            record_from_eure(&schema_eure).unwrap(),
+            record_from_eure(CARD_SCHEMA).unwrap()
+        ),
+        other => panic!("{other:?}"),
+    }
+    let bad_schema = execute(
+        &conn,
+        &host.ctx(),
+        VcsRequest::PutSchema {
+            repo_id: repo.clone(),
+            schema_eure: "a = `text`\na.$merge = \"lines\"\n".into(),
+        },
+    );
+    assert!(
+        matches!(bad_schema, VcsResponse::Error { error } if error.code == VcsErrorCode::Invalid)
+    );
+
+    let save = |record_eure: &str| {
+        execute(
+            &conn,
+            &host.ctx(),
+            VcsRequest::SaveRecord {
+                repo_id: repo.clone(),
+                object_id: None,
+                type_id: "card".into(),
+                schema_id: schema_id.clone(),
+                record_eure: record_eure.into(),
+                title: None,
+            },
+        )
+    };
+    match save(eure) {
         VcsResponse::Object { object } => {
             assert_eq!(object.body_kind, "record");
-            assert_eq!(object.schema_id.as_deref(), Some("card.v1"));
-            assert_eq!(
-                serde_json::from_str::<serde_json::Value>(object.record_json.as_deref().unwrap())
-                    .unwrap(),
-                back
-            );
+            assert_eq!(object.schema_id.as_deref(), Some(schema_id.as_str()));
+            let back = object.record_eure.as_deref().unwrap();
+            assert_eq!(record_from_eure(back).unwrap(), record);
+            // The decimal keeps the scale it was written with.
+            assert!(back.contains("1.50"), "{back}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // A record that does not match its schema is refused.
+    match save("title = 1\n") {
+        VcsResponse::Error { error } => {
+            assert_eq!(error.code, VcsErrorCode::Invalid);
+            assert!(error.message.contains("title"), "{}", error.message);
         }
         other => panic!("{other:?}"),
     }
@@ -678,6 +735,13 @@ fn record_conflict_and_historical_snapshots_are_readable() {
     let conn = Connection::open_in_memory().unwrap();
     let host = host();
     let repo = create(&conn, &host);
+    let schema_id = put_schema(&conn, &host, &repo);
+    let card = |title: &str| {
+        RecordValue::map([
+            ("title", RecordValue::text(title)),
+            ("count", RecordValue::int(7)),
+        ])
+    };
     let save = |text: &str, id: Option<String>| match run(
         &conn,
         &host,
@@ -685,8 +749,8 @@ fn record_conflict_and_historical_snapshots_are_readable() {
             repo_id: repo.clone(),
             object_id: id,
             type_id: "note".into(),
-            schema_id: "card.v1".into(),
-            record_json: serde_json::json!({"title": text, "count": 7}).to_string(),
+            schema_id: schema_id.clone(),
+            record_eure: card(text).to_eure(),
             title: None,
         },
     ) {
@@ -720,9 +784,7 @@ fn record_conflict_and_historical_snapshots_are_readable() {
                 Ok((r.get(0)?, r.get(1)?))
             })
             .unwrap();
-        let mut store = Store::open(&conn, RustDigest)
-            .unwrap()
-            .with_schemas(host.ctx().schemas);
+        let mut store = Store::open(&conn, RustDigest).unwrap();
         let mut r = store
             .repo(
                 RepoId::from_bytes(&repo_bytes).unwrap(),
@@ -737,8 +799,8 @@ fn record_conflict_and_historical_snapshots_are_readable() {
             .put_record_state(
                 oid,
                 "note",
-                "card.v1",
-                &record_from_json(r#"{"title":"A\nB-right\nC\n", "count":7}"#).unwrap(),
+                schema_id.parse().unwrap(),
+                &card("A\nB-right\nC\n"),
                 luvcs::cbor::Value::Map(vec![]),
             )
             .unwrap();
@@ -783,10 +845,8 @@ fn record_conflict_and_historical_snapshots_are_readable() {
         VcsResponse::Object { object } => object,
         other => panic!("{other:?}"),
     };
-    let record: serde_json::Value =
-        serde_json::from_str(historical.record_json.as_deref().unwrap()).unwrap();
-    assert_eq!(record["count"], 7);
-    assert_eq!(record["title"], "A\nB\nC\n");
+    let record = record_from_eure(historical.record_eure.as_deref().unwrap()).unwrap();
+    assert_eq!(record, card("A\nB\nC\n"));
     let objects = match run(
         &conn,
         &host,
@@ -799,26 +859,26 @@ fn record_conflict_and_historical_snapshots_are_readable() {
         other => panic!("{other:?}"),
     };
     let conflict = objects[0].conflict.as_ref().unwrap();
-    assert_eq!(conflict.driver, "merge.record.v1");
+    assert_eq!(conflict.driver, "merge.record.v2");
     assert!(conflict.merged_text.is_none());
-    let merged: serde_json::Value =
-        serde_json::from_str(conflict.merged_record_json.as_deref().unwrap()).unwrap();
-    assert_eq!(merged["count"], 7);
+    let merged = record_from_eure(conflict.merged_record_eure.as_deref().unwrap()).unwrap();
+    assert_eq!(merged, card("A\nB\nC\n"));
     for side in &conflict.sides {
-        let record: serde_json::Value = serde_json::from_str(side.as_deref().unwrap()).unwrap();
-        assert_eq!(record["count"], 7);
+        let record = record_from_eure(side.as_deref().unwrap()).unwrap();
+        assert_eq!(record.get("count"), Some(&RecordValue::int(7)));
     }
-    assert!(!conflict.terms.is_empty());
-    let candidates: Vec<serde_json::Value> = conflict.terms[0]
+    assert_eq!(conflict.terms.len(), 1);
+    assert_eq!(conflict.terms[0].path, "title#0");
+    let candidates: Vec<RecordValue> = conflict.terms[0]
         .candidates
         .iter()
-        .map(|c| serde_json::from_str(c.as_deref().unwrap()).unwrap())
+        .map(|c| record_from_eure(c.as_deref().unwrap()).unwrap())
         .collect();
     assert_eq!(
         candidates,
         vec![
-            serde_json::json!("B-left\n"),
-            serde_json::json!("B-right\n")
+            RecordValue::text("B-left\n"),
+            RecordValue::text("B-right\n")
         ]
     );
     match run(

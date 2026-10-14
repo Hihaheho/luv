@@ -1,7 +1,7 @@
 //! luv core.
 //!
 //! Canonical CBOR, keyed IDs, `ObjectState` / `Commit` / `Conflict`, the
-//! Patricia snapshot tree, `record.v1` values, merge drivers and (feature
+//! Patricia snapshot tree, `record.v2` values and their Eure schemas, merge drivers and (feature
 //! `store`) the SQLite-backed local store with the request API on top.
 //!
 //! Hosts supply hashing through [`digest::Digest`]; with `rust-digest` the
@@ -17,6 +17,7 @@ pub mod model;
 pub mod record;
 pub mod redaction;
 pub mod remote;
+pub mod schema;
 pub mod tree;
 
 #[cfg(feature = "store")]
@@ -46,4 +47,5 @@ pub use model::{
     Actor, ActorKind, BlobRef, Capabilities, Commit, Conflict, ConflictTerm, CoreError, ObjectBody,
     ObjectState, TermKind,
 };
-pub use record::{Element, FieldPath, FieldPolicy, RecordSchema, RecordValue};
+pub use record::{Data, FieldPath, RecordValue, Segment};
+pub use schema::{MergePolicy, RecordSchema};

@@ -7,7 +7,6 @@ use luvcs::api::{HostContext, VcsRepoInfo, VcsRequest, VcsResponse, execute};
 use luvcs::digest::RustDigest;
 use luvcs::model::ActorKind;
 use luvcs::remote::Remote;
-use luvcs::store::SchemaRegistry;
 use luvcs::sync::{self, PullReport, PushReport};
 use rusqlite::Connection;
 
@@ -43,7 +42,6 @@ impl Local {
             now_unix_ms: now_unix_ms(),
             device_id: self.device_id.clone(),
             actor_kind: ActorKind::User,
-            schemas: SchemaRegistry::default(),
         }
     }
 

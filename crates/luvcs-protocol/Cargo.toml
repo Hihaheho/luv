@@ -9,11 +9,12 @@ publish.workspace = true
 [features]
 default = ["config"]
 # `RemoteConfig`: the eure form of "how to reach a remote".
-config = ["dep:eure"]
+config = ["dep:eure-document", "dep:eure-macros"]
 
 [dependencies]
 serde = { workspace = true }
-eure = { version = "0.1.6", optional = true }
+eure-document = { workspace = true, optional = true }
+eure-macros = { workspace = true, optional = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }

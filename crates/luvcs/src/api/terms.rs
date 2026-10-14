@@ -4,21 +4,22 @@
 //! functions, so the merge is run again here: the text regions and record
 //! terms it yields are the conflict's terms, in the same order, and each
 //! answer goes where its term is. A merge that does not yield those terms
-//! any more (the record schema changed since) is refused rather than
-//! guessed at; the whole-body resolutions still work.
+//! any more (a newer driver, say) is refused rather than guessed at; the
+//! whole-body resolutions still work. The record schema is the one the
+//! sides name, kept in the repo as content, so it cannot have changed.
 
 use std::collections::BTreeMap;
 
-use super::{ApiResult, VcsError, VcsTermChoice, VcsTermPick, record_from_json_value};
+use super::{ApiResult, VcsError, VcsTermChoice, VcsTermPick, record_from_eure};
 use crate::cbor::{self, Value};
 use crate::digest::Digest;
 use crate::id::{ContentId, ObjectId, ObjectStateId};
 use crate::merge::record::{RecordMergeOutcome, merge_record, set_path};
 use crate::merge::text::{ConflictRegion, TextMergeOutcome, assemble, merge_text};
-use crate::merge::{RECORD_DRIVER_V1, TEXT_DRIVER_V1};
+use crate::merge::{RECORD_DRIVER_V2, TEXT_DRIVER_V1};
 use crate::model::{Conflict, ConflictTerm, ObjectBody, ObjectState, TermKind};
-use crate::record::{FieldPath, RecordValue};
-use crate::store::{Repo, SchemaRegistry, StoreError};
+use crate::record::{Data, FieldPath, RecordValue, Segment, Text};
+use crate::store::{Repo, StoreError};
 
 fn invalid(message: impl Into<String>) -> VcsError {
     VcsError::invalid(message)
@@ -32,7 +33,6 @@ fn no_side(index: u32) -> VcsError {
 /// `conflict`, from one choice per term.
 pub(super) fn resolve<D: Digest>(
     repo: &mut Repo<'_, '_, D>,
-    schemas: &SchemaRegistry,
     object_id: ObjectId,
     state: &ObjectState,
     conflict: &Conflict,
@@ -93,9 +93,7 @@ pub(super) fn resolve<D: Digest>(
     let mut ctx = Resolver { repo };
     let body = match conflict.driver.as_str() {
         TEXT_DRIVER_V1 => ctx.text_body(conflict, base.as_ref(), &sides, &body_answers)?,
-        RECORD_DRIVER_V1 => {
-            ctx.record_body(schemas, conflict, base.as_ref(), &sides, &body_answers)?
-        }
+        RECORD_DRIVER_V2 => ctx.record_body(conflict, base.as_ref(), &sides, &body_answers)?,
         _ => ctx.object_body(base.as_ref(), &sides, &body_answers)?,
     };
 
@@ -116,17 +114,7 @@ pub(super) fn resolve<D: Digest>(
                 ),
                 None => None,
             },
-            VcsTermPick::Value { value_json } => {
-                match serde_json::from_str::<serde_json::Value>(value_json) {
-                    Ok(serde_json::Value::String(s)) => Some(Value::text(s)),
-                    _ => {
-                        return Err(invalid(format!(
-                            "metadata {:?} takes a JSON string",
-                            term.path
-                        )));
-                    }
-                }
-            }
+            VcsTermPick::Value { value } => Some(Value::text(value.clone())),
             VcsTermPick::Absent => None,
             VcsTermPick::Both => unreachable!("checked above"),
         };
@@ -209,7 +197,6 @@ impl<D: Digest> Resolver<'_, '_, '_, D> {
 
     fn record_body(
         &mut self,
-        schemas: &SchemaRegistry,
         conflict: &Conflict,
         base: Option<&ObjectState>,
         sides: &[ObjectState],
@@ -218,7 +205,7 @@ impl<D: Digest> Resolver<'_, '_, '_, D> {
         let schema_id = sides
             .iter()
             .find_map(|s| match &s.body {
-                ObjectBody::Record { schema, .. } => Some(schema.clone()),
+                ObjectBody::Record { schema, .. } => Some(*schema),
                 _ => None,
             })
             .ok_or_else(|| invalid("record conflict without a record side"))?;
@@ -231,17 +218,15 @@ impl<D: Digest> Resolver<'_, '_, '_, D> {
                 schema: schema_id,
             });
         }
-        let schema = schemas
-            .get(&schema_id)
-            .ok_or_else(|| StoreError::UnknownSchema(schema_id.clone()))?;
+        let schema = self.repo.schema(schema_id)?;
         let [left, right] = sides else {
             return Err(invalid("a record conflict has two sides"));
         };
         let base_rec = base.map(|b| self.record_of(b)).transpose()?;
         let (lr, rr) = (self.record_of(left)?, self.record_of(right)?);
-        let (mut out, rterms) = match merge_record(schema, base_rec.as_ref(), &lr, &rr) {
+        let (mut out, rterms) = match merge_record(&schema, base_rec.as_ref(), &lr, &rr) {
             RecordMergeOutcome::Conflicted { merged, terms } => (merged, terms),
-            RecordMergeOutcome::Merged(_) => (RecordValue::Null, Vec::new()),
+            RecordMergeOutcome::Merged(_) => (RecordValue::null(), Vec::new()),
         };
         let same = rterms.len() == answers.len()
             && rterms
@@ -260,8 +245,13 @@ impl<D: Digest> Resolver<'_, '_, '_, D> {
         for (r, (_, pick)) in rterms.iter().zip(answers) {
             if r.kind == TermKind::TextRegion {
                 let field = r.path.parent().expect("a region is under its field");
-                let last = r.path.0.last().cloned().unwrap_or_default();
-                regions.entry(field).or_default().push((last, pick));
+                let Some(Segment::Region(index)) = r.path.0.last() else {
+                    return Err(invalid(format!("term {} is not a text region", r.path)));
+                };
+                regions
+                    .entry(field)
+                    .or_default()
+                    .push((format!("#{index}"), pick));
                 continue;
             }
             let value = match pick {
@@ -269,32 +259,43 @@ impl<D: Digest> Resolver<'_, '_, '_, D> {
                     .get(*index as usize)
                     .map(|v| (*v).clone())
                     .ok_or_else(|| no_side(*index))?,
-                VcsTermPick::Value { value_json } => {
-                    let json: serde_json::Value = serde_json::from_str(value_json)
-                        .map_err(|e| invalid(format!("term {:?}: {e}", r.path.to_string())))?;
-                    Some(record_from_json_value(&json)?)
-                }
+                VcsTermPick::Value { value } => Some(
+                    record_from_eure(value)
+                        .map_err(|e| invalid(format!("term {}: {}", r.path, e.message)))?,
+                ),
                 VcsTermPick::Absent => None,
                 VcsTermPick::Both => unreachable!("checked by the caller"),
             };
             set_path(&mut out, &r.path, value);
         }
         for (field, picks) in regions {
-            fn text<'v>(r: &'v RecordValue, field: &FieldPath) -> Option<&'v str> {
+            fn text<'v>(r: &'v RecordValue, field: &FieldPath) -> Option<&'v Text> {
                 r.at(field).and_then(RecordValue::as_text)
             }
             let (Some(l), Some(r)) = (text(&lr, &field), text(&rr, &field)) else {
                 return Err(invalid(format!("field {field} is not text on both sides")));
             };
             let b = base_rec.as_ref().and_then(|b| text(b, &field));
-            let outcome = merge_text(b.map(str::as_bytes), l.as_bytes(), r.as_bytes());
+            let outcome = merge_text(
+                b.map(|b| b.content.as_bytes()),
+                l.content.as_bytes(),
+                r.content.as_bytes(),
+            );
             let paths: Vec<String> = picks.iter().map(|(p, _)| p.clone()).collect();
             let bytes = fill_regions(&outcome, &paths, |i| picks[i].1)?;
             let merged = String::from_utf8(bytes)
                 .map_err(|_| invalid(format!("field {field} is not valid UTF-8 text")))?;
-            set_path(&mut out, &field, Some(RecordValue::Text(merged)));
+            // The field keeps its language and extensions; only the content
+            // was in question.
+            let mut value = lr.at(&field).cloned().expect("text on the left");
+            value.data = Data::Text(Text {
+                content: merged,
+                language: l.language.clone(),
+            });
+            set_path(&mut out, &field, Some(value));
         }
         out.validate().map_err(|e| invalid(e.to_string()))?;
+        self.repo.check_record(schema_id, &out)?;
         Ok(ObjectBody::Record {
             content: self
                 .repo
@@ -336,17 +337,15 @@ impl<D: Digest> Resolver<'_, '_, '_, D> {
                 .body
                 .clone(),
             VcsTermPick::Absent => ObjectBody::Deleted,
-            VcsTermPick::Value { value_json } => {
-                let json: serde_json::Value =
-                    serde_json::from_str(value_json).map_err(|e| invalid(e.to_string()))?;
+            VcsTermPick::Value { value } => {
                 let schema = sides.iter().find_map(|s| match &s.body {
-                    ObjectBody::Record { schema, .. } => Some(schema.clone()),
+                    ObjectBody::Record { schema, .. } => Some(*schema),
                     _ => None,
                 });
                 match schema {
                     Some(schema) => {
-                        let record = record_from_json_value(&json)?;
-                        record.validate().map_err(|e| invalid(e.to_string()))?;
+                        let record = record_from_eure(value)?;
+                        self.repo.check_record(schema, &record)?;
                         ObjectBody::Record {
                             content: self.repo.put_content(
                                 &record.encode().map_err(|e| invalid(e.to_string()))?,
@@ -354,14 +353,9 @@ impl<D: Digest> Resolver<'_, '_, '_, D> {
                             schema,
                         }
                     }
-                    None => {
-                        let serde_json::Value::String(text) = json else {
-                            return Err(invalid("a text object takes a JSON string"));
-                        };
-                        ObjectBody::Text {
-                            content: self.repo.put_content(text.as_bytes())?,
-                        }
-                    }
+                    None => ObjectBody::Text {
+                        content: self.repo.put_content(value.as_bytes())?,
+                    },
                 }
             }
             VcsTermPick::Both => unreachable!("checked by the caller"),
@@ -405,17 +399,7 @@ fn fill_regions<'p>(
             }
             VcsTermPick::Both => [region.left.as_slice(), &region.right].concat(),
             VcsTermPick::Absent => Vec::new(),
-            VcsTermPick::Value { value_json } => {
-                match serde_json::from_str::<serde_json::Value>(value_json) {
-                    Ok(serde_json::Value::String(s)) => s.into_bytes(),
-                    _ => {
-                        error.get_or_insert_with(|| {
-                            invalid(format!("region #{} takes a JSON string", region.index))
-                        });
-                        Vec::new()
-                    }
-                }
-            }
+            VcsTermPick::Value { value } => value.clone().into_bytes(),
         }
     });
     match error {

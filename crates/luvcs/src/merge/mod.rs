@@ -8,4 +8,4 @@ pub mod text;
 /// Identifies a driver and its version, recorded in every conflict and in
 /// the metadata of every automatically merged commit.
 pub const TEXT_DRIVER_V1: &str = "merge.text.v1";
-pub const RECORD_DRIVER_V1: &str = "merge.record.v1";
+pub const RECORD_DRIVER_V2: &str = "merge.record.v2";

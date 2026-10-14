@@ -72,8 +72,17 @@ fn has_table(tx: &rusqlite::Connection, name: &str) -> Result<bool> {
     )?)
 }
 
-/// The content IDs and blob IDs a state or conflict names.
+/// The content IDs and blob IDs a state names: its body, and a record's
+/// schema.
 fn state_refs(state: &ObjectState, contents: &mut Vec<ContentId>, blobs: &mut Vec<BlobId>) {
+    if let ObjectBody::Record { schema, .. } = &state.body {
+        contents.push(*schema);
+    }
+    body_refs(state, contents, blobs);
+}
+
+/// The content IDs and blob IDs of a state's body alone.
+fn body_refs(state: &ObjectState, contents: &mut Vec<ContentId>, blobs: &mut Vec<BlobId>) {
     match &state.body {
         ObjectBody::Text { content } | ObjectBody::Record { content, .. } => {
             contents.push(*content)
@@ -437,7 +446,12 @@ impl<D: Digest> Repo<'_, '_, D> {
                 let (mut contents, mut bs) = (Vec::new(), Vec::new());
                 let owner = if kind == KIND_STATE {
                     let state = ObjectState::decode(&bytes, &caps)?;
-                    state_refs(&state, &mut contents, &mut bs);
+                    body_refs(&state, &mut contents, &mut bs);
+                    // A schema is no object's body: it stays for every
+                    // record that names it.
+                    if let ObjectBody::Record { schema, .. } = &state.body {
+                        other_c.insert(*schema);
+                    }
                     state.object_id
                 } else {
                     let conflict = Conflict::decode(&bytes, &caps)?;

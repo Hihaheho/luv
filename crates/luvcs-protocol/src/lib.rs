@@ -80,10 +80,10 @@ pub mod error_code {
 /// path = "../shared"
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[cfg_attr(feature = "config", derive(eure::FromEure))]
+#[cfg_attr(feature = "config", derive(eure_macros::FromEure))]
 #[cfg_attr(
     feature = "config",
-    eure(crate = ::eure::document, rename_all = "kebab-case")
+    eure(crate = ::eure_document, rename_all = "kebab-case")
 )]
 pub struct RemoteConfig {
     /// A directory several devices can reach (a synced folder, a mount).

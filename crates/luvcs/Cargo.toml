@@ -33,6 +33,11 @@ hmac = { workspace = true, optional = true }
 rusqlite = { workspace = true, optional = true }
 ts-rs = { workspace = true, optional = true }
 uniffi = { workspace = true, optional = true }
+eure-reader = { workspace = true }
+eure-document = { workspace = true }
+eure-schema = { workspace = true }
+eure-fmt = { workspace = true }
+num-bigint = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

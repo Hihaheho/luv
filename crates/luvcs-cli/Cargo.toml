@@ -18,7 +18,10 @@ base64 = { workspace = true }
 hex = { workspace = true }
 rusqlite = { workspace = true }
 getrandom = "0.3"
-eure = "0.1.6"
+eure-reader = { workspace = true }
+eure-parol = { workspace = true }
+eure-document = { workspace = true }
+eure-macros = { workspace = true }
 globset = "0.4"
 similar = "2"
 clap = { version = "4", features = ["derive"] }

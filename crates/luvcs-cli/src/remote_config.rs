@@ -22,8 +22,7 @@ pub fn load(root: &Path) -> anyhow::Result<Option<RemoteConfig>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e.into()),
     };
-    let config: RemoteConfig = eure::parse_content(&text, path.clone())
-        .map_err(|m| anyhow::anyhow!("invalid {}: {m}", path.display()))?;
+    let config: RemoteConfig = crate::eure_file::read(&text, &path)?;
     config
         .spec()
         .map_err(|m| anyhow::anyhow!("{}: {m}", path.display()))?;

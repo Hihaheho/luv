@@ -13,7 +13,7 @@ It is alpha. Commands, APIs and the store format will change without compatibili
 An object is one of these:
 
 - text: a text document.
-- record: a structured value with fields and collections, close to JSON.
+- record: a structured value in the [Eure](https://eure.dev) data model: maps, arrays, tuples, sets, text with its language, integers, decimals, floats, bytes, and extensions such as `$variant`. A record is read and written as an Eure document.
 - binary: a byte string. The bytes live in a separate blob.
 - conflict: a merge result that has not been resolved.
 - deleted: the state that says an object was removed.
@@ -25,10 +25,11 @@ An object has a random ID that is independent of any path. A path is just one pi
 A three-way merge (base / left / right) is a pure function: the same input always gives the same result.
 
 - Text is merged by line with diff3 on top of a histogram diff. Line endings and whitespace are not normalized; bytes are taken as they are.
-- A record is merged per field path. The schema says, for each path, whether it is handled as Scalar, Set, List, Text or Opaque.
-- Elements of a collection have stable IDs. A Set merges adds and removals per element. A List also merges element order, and raises an order conflict only when both sides reordered it differently.
+- A record is merged along its schema, an Eure Schema document. Maps and tuples merge per key, sets per element (every add lands, and a removal on either side wins), and a union whose two sides chose different variants is one conflict. Anything else is compared as a whole.
+- An array whose schema names a `$merge-key` merges per element, each identified by that field, and merges element order too: an order conflict comes only when both sides reordered it differently. An array without one is compared as a whole. `$merge = "text"` merges a text field by line, and `$merge = "atomic"` keeps a value whole.
+- A schema is kept in the repo as a record, and its content ID is the schema ID, so it travels with the records that name it and a merge never depends on what a host has registered. A merge that is clean but breaks the schema (each side's adds fit a maximum, both together do not) is a conflict, not a commit.
 
-A conflict is not written into the file as markers. It is recorded as a `Conflict` object that keeps each disagreement with its kind: value, order, deleted-vs-edited, text region, or metadata (both sides renamed the object differently, say). You resolve it by taking one side, by giving the text or the record directly (with a title when the title is in conflict), or term by term: one answer per term (a side, both sides of a text region, a value of your own, or nothing), and luv merges the sides again and puts each answer where its term is.
+A conflict is not written into the file as markers. It is recorded as a `Conflict` object that keeps each disagreement with its kind: value, order, deleted-vs-edited, text region, invalid (a clean merge the schema refuses), or metadata (both sides renamed the object differently, say). You resolve it by taking one side, by giving the text or the record directly (with a title when the title is in conflict), or term by term: one answer per term (a side, both sides of a text region, a value of your own, or nothing), and luv merges the sides again and puts each answer where its term is.
 
 ### Operations are part of the history
 
@@ -143,7 +144,8 @@ and retry count; other errors require user attention.
 
 Use `ListObjects` / `ReadObject` with a commit ID to read a snapshot,
 `Log` / `Show` for commit history, and `ReadBlob` for binary content.
-Object views include text, record JSON, and conflict terms.
+Object views include text, records as Eure, and conflict terms. `PutSchema`
+stores a record schema and `SaveRecord` checks a record against it.
 
 The default `bundled-sqlite` feature includes SQLite. Hosts can disable
 default features and select `store` and `rust-digest` as needed.

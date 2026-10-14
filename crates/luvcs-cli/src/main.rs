@@ -10,6 +10,7 @@
 //! back.
 
 mod bookmark;
+mod eure_file;
 mod local;
 mod remote_config;
 
@@ -18,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 use base64::Engine as _;
 use clap::{Parser, Subcommand, ValueEnum};
-use eure::FromEure;
+use eure_macros::FromEure;
 use globset::{Glob, GlobSet, GlobSetBuilder};
 use luvcs::api::{VcsObjectView, VcsRequest, VcsResolution, VcsResponse};
 
@@ -32,7 +33,7 @@ const DEFAULT_LOG_LIMIT: u32 = 20;
 
 /// `Luv.eure`.
 #[derive(Debug, Clone, FromEure)]
-#[eure(crate = ::eure::document, rename_all = "kebab-case")]
+#[eure(crate = ::eure_document, rename_all = "kebab-case")]
 pub struct LuvConfig {
     /// Name of the repo this directory is the work tree of.
     pub repo: String,
@@ -44,8 +45,7 @@ pub struct LuvConfig {
 
 impl LuvConfig {
     pub fn parse(content: &str, path: &Path) -> anyhow::Result<Self> {
-        eure::parse_content(content, path.to_path_buf())
-            .map_err(|m| anyhow::anyhow!("invalid {}: {m}", path.display()))
+        eure_file::read(content, path)
     }
 
     fn render(&self) -> String {

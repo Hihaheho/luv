@@ -13,7 +13,7 @@
 
 #![cfg(feature = "store")]
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -22,9 +22,9 @@ use luvcs::cbor::Value;
 use luvcs::digest::RustDigest;
 use luvcs::id::{IdKey, ObjectId, OperationId, RepoId, WorkspaceId};
 use luvcs::model::{Actor, ActorKind};
-use luvcs::record::{FieldPolicy, RecordSchema, RecordValue};
+use luvcs::record::RecordValue;
 use luvcs::remote::{MemoryRemote, Remote};
-use luvcs::store::{OperationContext, SchemaRegistry, Store};
+use luvcs::store::{OperationContext, Store};
 use luvcs::sync::{pull, push};
 use luvcs_protocol::EntryBody;
 use rusqlite::Connection;
@@ -35,6 +35,8 @@ struct Device {
     conn: Connection,
     random: Random,
     clock: Cell<i64>,
+    /// The task schema's ID, once stored.
+    schema: RefCell<Option<String>>,
     _dir: tempfile::TempDir,
 }
 
@@ -58,6 +60,7 @@ impl Device {
                 Ok(())
             }),
             clock: Cell::new(1_700_000_000_000),
+            schema: RefCell::new(None),
             _dir: dir,
         }
     }
@@ -70,7 +73,6 @@ impl Device {
             now_unix_ms: self.clock.get(),
             device_id: "bench".into(),
             actor_kind: ActorKind::User,
-            schemas: SchemaRegistry::default().register(schema()),
         }
     }
 
@@ -82,13 +84,29 @@ impl Device {
         r
     }
 
+    fn schema_id(&self, repo: &str) -> String {
+        if let Some(id) = self.schema.borrow().clone() {
+            return id;
+        }
+        let id = match self.run(VcsRequest::PutSchema {
+            repo_id: repo.into(),
+            schema_eure: SCHEMA.into(),
+        }) {
+            VcsResponse::Schema { schema_id, .. } => schema_id,
+            other => panic!("{other:?}"),
+        };
+        *self.schema.borrow_mut() = Some(id.clone());
+        id
+    }
+
     fn save(&self, repo: &str, object: Option<&str>, i: usize, rev: usize) -> String {
+        let schema_id = self.schema_id(repo);
         match self.run(VcsRequest::SaveRecord {
             repo_id: repo.into(),
             object_id: object.map(Into::into),
             type_id: "task".into(),
-            schema_id: "task.v1".into(),
-            record_json: record_json(i, rev),
+            schema_id,
+            record_eure: record_eure(i, rev),
             title: Some(format!("tasks/{i}.json")),
         }) {
             VcsResponse::Object { object } => object.object_id,
@@ -123,21 +141,27 @@ impl Device {
     }
 }
 
-fn schema() -> RecordSchema {
-    RecordSchema::new("task.v1")
-        .field("notes", FieldPolicy::Text)
-        .field("tags", FieldPolicy::Set)
+const SCHEMA: &str = r#"
+name = `text`
+rev = `integer`
+done = `boolean`
+notes = `text`
+notes.$merge = "text"
+tags {
+  $variant: set
+  item = `text`
 }
+"#;
 
-fn record_json(i: usize, rev: usize) -> String {
+fn record_eure(i: usize, rev: usize) -> String {
     format!(
-        r#"{{"name": "task {i}", "rev": {rev}, "done": false, "notes": "line one of task {i}\nline two\n", "tags": {{"$elements": [{{"id": "t{}", "value": "tag"}}]}}}}"#,
+        "name = \"task {i}\"\nrev = {rev}\ndone = false\nnotes = \"line one of task {i}\\nline two\\n\"\ntags = #{{\"t{}\"}}\n",
         i % 7
     )
 }
 
 fn record_value(i: usize) -> RecordValue {
-    luvcs::api::record_from_json(&record_json(i, 0)).unwrap()
+    RecordValue::from_eure(&record_eure(i, 0)).unwrap()
 }
 
 /// A repo of `n` records on a new device, recorded as one commit; the
@@ -171,6 +195,10 @@ fn filled(n: usize, seed: u64) -> (Device, String, Vec<String>) {
             )
             .unwrap();
         let ws = WorkspaceId::from_bytes(&ws).unwrap();
+        let schema = r
+            .put_schema(&RecordValue::from_eure(SCHEMA).unwrap())
+            .unwrap();
+        *d.schema.borrow_mut() = Some(schema.to_string());
         for (batch, start) in (0..n).step_by(5_000).enumerate() {
             let mut changes = Vec::new();
             for i in start..(start + 5_000).min(n) {
@@ -182,7 +210,7 @@ fn filled(n: usize, seed: u64) -> (Device, String, Vec<String>) {
                     .put_record_state(
                         oid,
                         "task",
-                        "task.v1",
+                        schema,
                         &record_value(i),
                         Value::map([("title", Value::text(format!("tasks/{i}.json")))]),
                     )

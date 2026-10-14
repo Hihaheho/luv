@@ -10,7 +10,6 @@ use luvcs::api::{HostContext, VcsErrorCode, VcsObjectView, VcsRequest, VcsRespon
 use luvcs::digest::RustDigest;
 use luvcs::model::ActorKind;
 use luvcs::remote::{DirRemote, MemoryRemote, Remote, RemoteError};
-use luvcs::store::SchemaRegistry;
 use luvcs::sync::{PushReport, SyncError, pull, push};
 use luvcs_protocol::EntryBody;
 use rusqlite::{Connection, params};
@@ -51,7 +50,6 @@ impl Device {
             now_unix_ms: self.clock.get(),
             device_id: format!("dev-{}", self.seed.get()),
             actor_kind: ActorKind::User,
-            schemas: SchemaRegistry::default(),
         }
     }
 
@@ -368,6 +366,51 @@ fn a_body_another_object_shares_is_kept() {
         a.object_at(&repo, &two, None).text.as_deref(),
         Some("same\n")
     );
+}
+
+#[test]
+fn a_purge_erases_a_record_and_keeps_its_schema() {
+    let a = Device::new(0);
+    let repo = a.create("notes");
+    let schema_id = match a.run(VcsRequest::PutSchema {
+        repo_id: repo.clone(),
+        schema_eure: "secret = `text`\n".into(),
+    }) {
+        VcsResponse::Schema { schema_id, .. } => schema_id,
+        other => panic!("{other:?}"),
+    };
+    let save = || match a.run(VcsRequest::SaveRecord {
+        repo_id: repo.clone(),
+        object_id: None,
+        type_id: "note".into(),
+        schema_id: schema_id.clone(),
+        record_eure: "secret = \"s3cr3t\"\n".into(),
+        title: None,
+    }) {
+        VcsResponse::Object { object } => object.object_id,
+        other => panic!("{other:?}"),
+    };
+    let id = save();
+    let commit = a.record(&repo, "a record");
+    a.delete(&repo, &id);
+    a.record(&repo, "drop it");
+    match a.purge(&repo, &[&id], &[]) {
+        VcsResponse::Purged { contents, .. } => assert_eq!(contents, 1),
+        other => panic!("{other:?}"),
+    }
+    let old = a.object_at(&repo, &id, Some(&commit));
+    assert!(old.redacted);
+    assert_eq!(old.record_eure, None);
+    // The schema is no body of the purged record: it stays, and serves the
+    // next record.
+    match a.run(VcsRequest::ReadSchema {
+        repo_id: repo.clone(),
+        schema_id: schema_id.clone(),
+    }) {
+        VcsResponse::Schema { .. } => {}
+        other => panic!("{other:?}"),
+    }
+    save();
 }
 
 #[test]
