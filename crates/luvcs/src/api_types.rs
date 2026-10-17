@@ -620,6 +620,10 @@ pub struct VcsConflictView {
     pub merged_record_eure: Option<String>,
     /// Full text or record Eure of each side, for whole-side resolution.
     pub sides: Vec<Option<String>>,
+    /// The title each side gives the object (the file it is at), whether or
+    /// not the titles are in conflict: taking a side takes its title.
+    #[serde(default)]
+    pub side_titles: Vec<Option<String>>,
     pub terms: Vec<VcsConflictTermView>,
 }
 

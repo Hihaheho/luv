@@ -547,8 +547,10 @@ impl<D: Digest> Session<'_, '_, '_, D> {
     ) -> ApiResult<VcsConflictView> {
         let c = self.repo.get_conflict(conflict_id)?;
         let mut sides = Vec::with_capacity(c.sides.len());
+        let mut side_titles = Vec::with_capacity(c.sides.len());
         for s in &c.sides {
             sides.push(self.state_text(*s)?);
+            side_titles.push(title_of(&self.repo.get_state(*s)?));
         }
         let mut terms = Vec::with_capacity(c.terms.len());
         for t in &c.terms {
@@ -592,6 +594,7 @@ impl<D: Digest> Session<'_, '_, '_, D> {
             },
             marked_text: self.marked_text(&c)?,
             sides,
+            side_titles,
             terms,
         })
     }

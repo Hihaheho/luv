@@ -518,16 +518,33 @@ impl Ctx<'_> {
         }
     }
 
-    /// The saved (working tree) objects whose titles the allowlist covers.
+    /// The saved (working tree) objects whose titles the allowlist covers,
+    /// by path. When several objects ask for one path (two devices added a
+    /// file there on their own), the one with the lowest ID holds the path
+    /// and the others are `clashes`.
     fn saved(&self) -> anyhow::Result<BTreeMap<String, VcsObjectView>> {
-        let VcsResponse::Objects { objects } = self.call(VcsRequest::ListObjects {
+        Ok(self.saved_and_clashes()?.0)
+    }
+
+    /// The objects that ask for a path another object holds: `luv mv
+    /// <object ID> <path>` gives each its own.
+    fn clashes(&self) -> anyhow::Result<Vec<VcsObjectView>> {
+        Ok(self.saved_and_clashes()?.1)
+    }
+
+    fn saved_and_clashes(
+        &self,
+    ) -> anyhow::Result<(BTreeMap<String, VcsObjectView>, Vec<VcsObjectView>)> {
+        let VcsResponse::Objects { mut objects } = self.call(VcsRequest::ListObjects {
             repo_id: self.repo_id.clone(),
             commit_id: None,
         })?
         else {
             anyhow::bail!("unexpected response to list");
         };
+        objects.sort_by(|a, b| a.object_id.cmp(&b.object_id));
         let mut by_path = BTreeMap::new();
+        let mut clashes = Vec::new();
         for object in objects {
             let Some(title) = path_of(&object) else {
                 continue;
@@ -535,11 +552,29 @@ impl Ctx<'_> {
             if object.body_kind == "deleted" || !self.tree.allows(&title) {
                 continue;
             }
-            if by_path.insert(title.clone(), object).is_some() {
-                anyhow::bail!("two objects of the repo are titled {title:?}");
+            match by_path.entry(title) {
+                std::collections::btree_map::Entry::Vacant(v) => {
+                    v.insert(object);
+                }
+                std::collections::btree_map::Entry::Occupied(_) => clashes.push(object),
             }
         }
-        Ok(by_path)
+        Ok((by_path, clashes))
+    }
+
+    fn print_clashes(&self) -> anyhow::Result<()> {
+        let clashes = self.clashes()?;
+        for object in &clashes {
+            println!(
+                "! {} also asks for {}",
+                object.object_id,
+                path_of(object).unwrap_or_default()
+            );
+        }
+        if !clashes.is_empty() {
+            println!("give each its own path with `luv mv <obj_…> <path>`, then `luv commit`");
+        }
+        Ok(())
     }
 
     fn same_content(&self, object: &VcsObjectView, bytes: &[u8]) -> anyhow::Result<bool> {
@@ -670,7 +705,12 @@ impl Ctx<'_> {
         if !paths.is_empty() {
             println!("resolve each with `luv resolve <path>` (an obj_… with --take)");
         }
-        if changes.is_empty() && pending.is_empty() && paths.is_empty() {
+        self.print_clashes()?;
+        if changes.is_empty()
+            && pending.is_empty()
+            && paths.is_empty()
+            && self.clashes()?.is_empty()
+        {
             println!("nothing to commit");
         }
         Ok(())
@@ -717,6 +757,9 @@ impl Ctx<'_> {
     }
 
     fn mv(&self, from: &str, to: &str) -> anyhow::Result<()> {
+        if let Some(object) = self.clashes()?.into_iter().find(|o| o.object_id == from) {
+            return self.mv_clash(&object, &normalize(to));
+        }
         let from = normalize(from);
         let mut to = normalize(to);
         // Into a directory, under the same name.
@@ -785,6 +828,30 @@ impl Ctx<'_> {
         Ok(())
     }
 
+    /// Gives an object that asks for a path another holds a path of its own.
+    fn mv_clash(&self, object: &VcsObjectView, to: &str) -> anyhow::Result<()> {
+        let from = path_of(object).unwrap_or_default();
+        let saved = self.saved()?;
+        self.ensure_free(to, "", &saved)?;
+        if to == from {
+            anyhow::bail!("{to} is the path in dispute; choose another");
+        }
+        self.call(VcsRequest::SetTitle {
+            repo_id: self.repo_id.clone(),
+            object_id: object.object_id.clone(),
+            title: Some(to.to_owned()),
+        })?;
+        let after = self.saved()?;
+        let moved = after
+            .get(to)
+            .ok_or_else(|| anyhow::anyhow!("{to} is not tracked after the move"))?;
+        if let Some(bytes) = self.written(to, moved)? {
+            self.tree.write(to, &bytes)?;
+        }
+        println!("R {} -> {to}", object.object_id);
+        Ok(())
+    }
+
     /// Every conflict in the working tree, sorted: by its path when it is
     /// a file here, else by its object ID (outside the allowlist, or with
     /// no path to put it at), so none is ever left out.
@@ -813,14 +880,45 @@ impl Ctx<'_> {
     /// that rewrites the files would lose them.
     fn ensure_clean(&self, what: &str) -> anyhow::Result<()> {
         let changes = self.changes(&[])?;
-        if !changes.is_empty() {
-            let paths: Vec<&str> = changes.iter().map(|c| c.path.as_str()).collect();
+        let mut paths: Vec<String> = changes.iter().map(|c| c.path.clone()).collect();
+        // A file in conflict is not compared by `changes`: it is dirty when
+        // it is not what was last written there (the user's resolution).
+        for (path, object) in self.saved()? {
+            if object.body_kind != "conflict" {
+                continue;
+            }
+            let Some(written) = self.written(&path, &object)? else {
+                // No text to compare with, so a binary edited since the
+                // merge cannot be told from the one the merge left.
+                if self.tree.root.join(&path).exists() {
+                    paths.push(path);
+                }
+                continue;
+            };
+            if std::fs::read(self.tree.root.join(&path)).is_ok_and(|disk| disk != written) {
+                paths.push(path);
+            }
+        }
+        if !paths.is_empty() {
             anyhow::bail!(
                 "{what} would overwrite changes on disk ({}); commit or restore them first",
                 paths.join(", ")
             );
         }
         Ok(())
+    }
+
+    /// What `checkout` leaves on disk for a saved object: None for a
+    /// conflict that is no text, which keeps the file as it is.
+    fn written(&self, path: &str, object: &VcsObjectView) -> anyhow::Result<Option<Vec<u8>>> {
+        if object.body_kind == "conflict"
+            && let Some(conflict) = &object.conflict
+            && conflict.marked_text.is_none()
+            && !matches!(conflict.sides.first(), Some(Some(_)))
+        {
+            return Ok(None);
+        }
+        self.bytes_of(path, object).map(Some)
     }
 
     /// What a saved object looks like as a file.
@@ -869,7 +967,9 @@ impl Ctx<'_> {
             if before.get(path).map(|o| &o.state_id) == Some(&object.state_id) {
                 continue;
             }
-            let bytes = self.bytes_of(path, object)?;
+            let Some(bytes) = self.written(path, object)? else {
+                continue;
+            };
             if std::fs::read(self.tree.root.join(path)).ok().as_deref() != Some(&bytes[..]) {
                 self.tree.write(path, &bytes)?;
                 println!("wrote {path}");
@@ -898,8 +998,12 @@ impl Ctx<'_> {
             for path in self.conflict_names()? {
                 println!("C {path}");
             }
-            println!("resolve each with `luv resolve <path>`, then `luv commit`");
+            println!(
+                "resolve each with `luv resolve <path>` (`--take ours|theirs` for a binary), \
+                 then `luv commit`"
+            );
         }
+        self.print_clashes()?;
         Ok(())
     }
 
@@ -942,6 +1046,24 @@ impl Ctx<'_> {
                 }
             }
         };
+        let moves_to = match &resolution {
+            VcsResolution::Text { title, .. } => title.clone(),
+            // The title the chosen side has, in conflict or not; the object
+            // may be outside the allowlist, so not among `before`.
+            VcsResolution::Side { index } => self
+                .object(&object_id)?
+                .and_then(|o| o.conflict)
+                .and_then(|c| c.side_titles.get(*index as usize).cloned().flatten())
+                // Outside the allowlist no file is written.
+                .filter(|title| self.tree.allows(title)),
+            // Not built by the CLI.
+            VcsResolution::Record { .. } | VcsResolution::Terms { .. } => None,
+        };
+        if let Some(title) = moves_to
+            && title != path
+        {
+            self.ensure_free(&title, &path, &before)?;
+        }
         self.call(VcsRequest::Resolve {
             repo_id: self.repo_id.clone(),
             object_id,
@@ -949,6 +1071,46 @@ impl Ctx<'_> {
         })?;
         self.checkout(&before)?;
         println!("resolved {path}");
+        Ok(())
+    }
+
+    /// A saved object by ID, whether or not the allowlist covers it.
+    fn object(&self, object_id: &str) -> anyhow::Result<Option<VcsObjectView>> {
+        let VcsResponse::Objects { objects } = self.call(VcsRequest::ListObjects {
+            repo_id: self.repo_id.clone(),
+            commit_id: None,
+        })?
+        else {
+            anyhow::bail!("unexpected response to list");
+        };
+        Ok(objects.into_iter().find(|o| o.object_id == object_id))
+    }
+
+    /// Refuses `to` for a file now at `from` when another object holds it
+    /// or anything is on disk there: writing it would replace that.
+    fn ensure_free(
+        &self,
+        to: &str,
+        from: &str,
+        saved: &BTreeMap<String, VcsObjectView>,
+    ) -> anyhow::Result<()> {
+        if !self.tree.allows(to) {
+            anyhow::bail!("{to} is not allowlisted in {CONFIG_FILE}");
+        }
+        let folded = to.to_lowercase();
+        if let Some(taken) = saved
+            .keys()
+            .find(|p| p.as_str() != from && p.to_lowercase() == folded)
+        {
+            anyhow::bail!("{taken} is tracked already");
+        }
+        // A rename that changes only case finds the file itself there on a
+        // case-insensitive file system.
+        if from.to_lowercase() != folded
+            && std::fs::symlink_metadata(self.tree.root.join(to)).is_ok()
+        {
+            anyhow::bail!("{to} exists already");
+        }
         Ok(())
     }
 
@@ -997,6 +1159,15 @@ impl Ctx<'_> {
             anyhow::bail!(
                 "{} in conflict; resolve with `luv resolve <path>` first",
                 conflicts.join(", ")
+            );
+        }
+        if let Some(object) = self.clashes()?.first() {
+            anyhow::bail!(
+                "{} asks for {}, which another object holds; give it a path with \
+                 `luv mv {} <path>` first",
+                object.object_id,
+                path_of(object).unwrap_or_default(),
+                object.object_id
             );
         }
         let changes = self.changes(paths)?;
@@ -1183,10 +1354,20 @@ impl Ctx<'_> {
             anyhow::bail!("unexpected response to list");
         };
         let mut restored = 0;
+        let mut objects = objects;
+        objects.sort_by(|a, b| a.object_id.cmp(&b.object_id));
+        let mut seen = BTreeSet::new();
         for object in objects {
             let Some(title) = object.title.clone() else {
                 continue;
             };
+            if object.body_kind != "deleted" && !seen.insert(title.clone()) {
+                println!(
+                    "skipped {} (another object holds {title})",
+                    object.object_id
+                );
+                continue;
+            }
             if object.body_kind == "deleted" || !self.tree.allows(&title) || !wanted(&title) {
                 continue;
             }
@@ -1500,6 +1681,219 @@ mod tests {
         )
         .unwrap();
         assert_eq!(target_of(a.path(), "main"), Some(ours));
+    }
+
+    #[test]
+    fn undo_keeps_a_conflict_resolution_in_progress() {
+        let (_remote, a, b) = two_devices();
+        let theirs = diverge(a.path(), b.path(), "1\n2a\n3\n", "1\n2b\n3\n");
+        luv(a.path(), &["merge", &theirs]).unwrap();
+        let file = a.path().join("n.md");
+        std::fs::write(&file, "1\n2ab\n3\n").unwrap();
+        assert!(luv(a.path(), &["undo"]).is_err());
+        assert!(luv(a.path(), &["redo"]).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "1\n2ab\n3\n");
+        // Untouched markers are not a change: undo goes through.
+        luv(a.path(), &["restore"]).unwrap();
+        luv(a.path(), &["undo"]).unwrap();
+    }
+
+    #[test]
+    fn resolve_never_overwrites_the_file_it_moves_to() {
+        let (_remote, a, b) = two_devices();
+        let theirs = diverge(a.path(), b.path(), "1\n2a\n3\n", "1\n2b\n3\n");
+        luv(a.path(), &["merge", &theirs]).unwrap();
+        std::fs::write(a.path().join("n.md"), "1\n2ab\n3\n").unwrap();
+        std::fs::write(a.path().join("other.md"), "mine\n").unwrap();
+        let err = luv(a.path(), &["resolve", "n.md", "--title", "other.md"]).unwrap_err();
+        assert!(err.to_string().contains("exists already"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(a.path().join("other.md")).unwrap(),
+            "mine\n"
+        );
+        // Nothing was recorded: the conflict is still there.
+        std::fs::remove_file(a.path().join("other.md")).unwrap();
+        luv(a.path(), &["resolve", "n.md", "--title", "other.md"]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(a.path().join("other.md")).unwrap(),
+            "1\n2ab\n3\n"
+        );
+        assert!(!a.path().join("n.md").exists());
+    }
+
+    #[test]
+    fn two_new_files_at_one_path_are_told_apart_by_object() {
+        let (_remote, a, b) = two_devices();
+        std::fs::write(a.path().join("new.md"), "from a\n").unwrap();
+        luv(a.path(), &["commit", "-m", "a"]).unwrap();
+        luv(a.path(), &["push"]).unwrap();
+        std::fs::write(b.path().join("new.md"), "from b\n").unwrap();
+        luv(b.path(), &["commit", "-m", "b"]).unwrap();
+        luv(b.path(), &["push"]).unwrap();
+        luv(a.path(), &["pull"]).unwrap();
+        let ours = base(a.path());
+        let theirs = heads(a.path()).into_iter().find(|h| *h != ours).unwrap();
+        luv(a.path(), &["merge", &theirs]).unwrap();
+
+        // The CLI still works, and says what is wrong.
+        luv(a.path(), &["status"]).unwrap();
+        let err = luv(a.path(), &["commit", "-m", "x"]).unwrap_err();
+        assert!(err.to_string().contains("luv mv"), "{err}");
+        let loser = ctx_check(a.path(), |ctx| {
+            let clashes = ctx.clashes().unwrap();
+            assert_eq!(clashes.len(), 1);
+            clashes[0].object_id.clone()
+        });
+        // An object that is no clash is not taken for one.
+        assert!(luv(a.path(), &["mv", &loser, "n.md"]).is_err());
+        luv(a.path(), &["mv", &loser, "other.md"]).unwrap();
+        luv(a.path(), &["commit", "-m", "merged"]).unwrap();
+        let mut texts = [
+            std::fs::read_to_string(a.path().join("new.md")).unwrap(),
+            std::fs::read_to_string(a.path().join("other.md")).unwrap(),
+        ];
+        texts.sort();
+        assert_eq!(texts, ["from a\n", "from b\n"]);
+        luv(a.path(), &["undo"]).unwrap();
+    }
+
+    /// Both devices change `x.bin`; returns b's head as a sees it.
+    fn binary_conflict(a: &Path, b: &Path) -> String {
+        let cfg = |d: &Path| {
+            let config = LuvConfig {
+                repo: "notes".into(),
+                include: vec!["**/*.md".into(), "**/*.bin".into()],
+            };
+            std::fs::write(d.join(CONFIG_FILE), config.render()).unwrap();
+        };
+        cfg(a);
+        cfg(b);
+        std::fs::write(a.join("x.bin"), [0u8, 1, 2]).unwrap();
+        luv(a, &["commit", "-m", "bin"]).unwrap();
+        luv(a, &["push"]).unwrap();
+        luv(b, &["pull"]).unwrap();
+        luv(b, &["merge", &base(a)]).unwrap();
+        std::fs::write(a.join("x.bin"), [0u8, 1, 3]).unwrap();
+        luv(a, &["commit", "-m", "a"]).unwrap();
+        luv(a, &["push"]).unwrap();
+        std::fs::write(b.join("x.bin"), [0u8, 1, 4]).unwrap();
+        luv(b, &["commit", "-m", "b"]).unwrap();
+        luv(b, &["push"]).unwrap();
+        luv(a, &["pull"]).unwrap();
+        let ours = base(a);
+        heads(a).into_iter().find(|h| *h != ours).unwrap()
+    }
+
+    #[test]
+    fn a_binary_conflict_merges_and_keeps_our_file() {
+        let (_remote, a, b) = two_devices();
+        let theirs = binary_conflict(a.path(), b.path());
+        luv(a.path(), &["merge", &theirs]).unwrap();
+        assert_eq!(std::fs::read(a.path().join("x.bin")).unwrap(), [0u8, 1, 3]);
+        luv(a.path(), &["resolve", "x.bin", "--take", "theirs"]).unwrap();
+        assert_eq!(std::fs::read(a.path().join("x.bin")).unwrap(), [0u8, 1, 4]);
+    }
+
+    #[test]
+    fn undo_keeps_a_binary_edited_during_a_conflict() {
+        let (_remote, a, b) = two_devices();
+        let theirs = binary_conflict(a.path(), b.path());
+        luv(a.path(), &["merge", &theirs]).unwrap();
+        std::fs::write(a.path().join("x.bin"), [9u8, 9, 9]).unwrap();
+        assert!(luv(a.path(), &["undo"]).is_err());
+        assert_eq!(std::fs::read(a.path().join("x.bin")).unwrap(), [9u8, 9, 9]);
+    }
+
+    #[test]
+    fn taking_a_side_never_moves_onto_an_untracked_file() {
+        let (_remote, a, b) = two_devices();
+        luv(a.path(), &["mv", "n.md", "left.md"]).unwrap();
+        luv(a.path(), &["commit", "-m", "a"]).unwrap();
+        luv(a.path(), &["push"]).unwrap();
+        luv(b.path(), &["mv", "n.md", "right.md"]).unwrap();
+        luv(b.path(), &["commit", "-m", "b"]).unwrap();
+        luv(b.path(), &["push"]).unwrap();
+        luv(a.path(), &["pull"]).unwrap();
+        let ours = base(a.path());
+        let theirs = heads(a.path()).into_iter().find(|h| *h != ours).unwrap();
+        luv(a.path(), &["merge", &theirs]).unwrap();
+        std::fs::write(a.path().join("right.md"), "mine\n").unwrap();
+        let err = luv(a.path(), &["resolve", "left.md", "--take", "theirs"]).unwrap_err();
+        assert!(err.to_string().contains("exists already"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(a.path().join("right.md")).unwrap(),
+            "mine\n"
+        );
+        std::fs::remove_file(a.path().join("right.md")).unwrap();
+        luv(a.path(), &["resolve", "left.md", "--take", "theirs"]).unwrap();
+        assert!(a.path().join("right.md").exists());
+    }
+
+    #[test]
+    fn taking_a_side_checks_its_title_without_a_title_conflict() {
+        let (_remote, a, b) = two_devices();
+        std::fs::write(a.path().join("n.md"), "1\n2a\n3\n").unwrap();
+        luv(a.path(), &["commit", "-m", "a"]).unwrap();
+        luv(a.path(), &["push"]).unwrap();
+        luv(b.path(), &["mv", "n.md", "renamed.md"]).unwrap();
+        std::fs::write(b.path().join("renamed.md"), "1\n2b\n3\n").unwrap();
+        luv(b.path(), &["commit", "-m", "b"]).unwrap();
+        luv(b.path(), &["push"]).unwrap();
+        luv(a.path(), &["pull"]).unwrap();
+        let ours = base(a.path());
+        let theirs = heads(a.path()).into_iter().find(|h| *h != ours).unwrap();
+        luv(a.path(), &["merge", &theirs]).unwrap();
+        std::fs::write(a.path().join("n.md"), "mine\n").unwrap();
+        let err = luv(a.path(), &["resolve", "renamed.md", "--take", "ours"]).unwrap_err();
+        assert!(err.to_string().contains("exists already"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(a.path().join("n.md")).unwrap(),
+            "mine\n"
+        );
+    }
+
+    #[test]
+    fn taking_a_side_of_an_object_outside_the_allowlist_checks_where_it_lands() {
+        let (_remote, a, b) = two_devices();
+        luv(a.path(), &["mv", "n.md", "left.md"]).unwrap();
+        luv(a.path(), &["commit", "-m", "a"]).unwrap();
+        luv(a.path(), &["push"]).unwrap();
+        luv(b.path(), &["mv", "n.md", "right.md"]).unwrap();
+        luv(b.path(), &["commit", "-m", "b"]).unwrap();
+        luv(b.path(), &["push"]).unwrap();
+        luv(a.path(), &["pull"]).unwrap();
+        let ours = base(a.path());
+        let theirs = heads(a.path()).into_iter().find(|h| *h != ours).unwrap();
+        luv(a.path(), &["merge", &theirs]).unwrap();
+        let config = LuvConfig {
+            repo: "notes".into(),
+            include: vec!["right.md".into()],
+        };
+        std::fs::write(a.path().join(CONFIG_FILE), config.render()).unwrap();
+        std::fs::write(a.path().join("right.md"), "mine\n").unwrap();
+        let id = ctx_check(a.path(), |ctx| {
+            let VcsResponse::Status { status } = ctx
+                .call(VcsRequest::Status {
+                    repo_id: ctx.repo_id.clone(),
+                })
+                .unwrap()
+            else {
+                panic!()
+            };
+            status.conflicts[0].object_id.clone()
+        });
+        let err = luv(a.path(), &["resolve", &id, "--take", "theirs"]).unwrap_err();
+        assert!(err.to_string().contains("exists already"), "{err}");
+        assert_eq!(
+            std::fs::read_to_string(a.path().join("right.md")).unwrap(),
+            "mine\n"
+        );
+        // Landing outside the allowlist writes nothing.
+        luv(a.path(), &["resolve", &id, "--take", "ours"]).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(a.path().join("right.md")).unwrap(),
+            "mine\n"
+        );
     }
 
     #[test]
